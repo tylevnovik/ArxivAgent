@@ -1,0 +1,30 @@
+你需要根据上一轮检索的审核反馈，优化检索策略并构造新的 arXiv 检索式。
+
+## 用户原始需求
+{user_query}
+
+## 上一轮检索式
+{previous_query}
+
+## 上一轮审核反馈
+{review_feedback}
+
+## 历史检索记忆
+{search_memory}
+
+## 优化原则
+1. 根据审核反馈中的建议调整检索策略
+2. 如果上一轮结果过少，考虑放宽条件（如使用 OR、减少限定词）
+3. 如果上一轮结果不相关，考虑收紧条件（如使用 AND、增加限定词）
+4. 避免重复使用已证明无效的检索式
+5. 可以尝试不同的关键词组合或同义词
+
+请以严格的 JSON 格式输出，不要包含任何其他文本或 markdown 标记：
+{{
+  "optimization_analysis": "优化分析说明（中文）",
+  "changes_made": ["具体调整1", "具体调整2"],
+  "arxiv_query": "优化后的新检索式",
+  "sort_by": "relevance 或 lastUpdatedDate 或 submittedDate",
+  "max_results": 10,
+  "expected_improvement": "预期改进效果说明（中文）"
+}}

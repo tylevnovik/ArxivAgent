@@ -1,0 +1,33 @@
+arXiv API 检索出现了错误，请分析错误原因并生成一个修正后的检索式。
+
+## 用户原始需求
+{user_query}
+
+## 出错的检索式
+{failed_query}
+
+## 错误信息
+{error_message}
+
+## 历史检索记忆
+{search_memory}
+
+## 常见错误原因及修复方法
+1. **检索式语法/HTTP 500 崩溃**：arXiv 后端在遇到不支持的语法、特殊的保留字符组合，或格式不完全匹配时常会抛出 **HTTP 500 错误**（而不是 400 错误）。请尝试完全修改结构并简化检索式。
+2. **日期/时间过滤语法**：如果在 `search_query` 中使用 `submittedDate`，格式必须严格是 `[YYYYMMDDHHMM TO YYYYMMDDHHMM]`，例如 `submittedDate:[202401010000 TO 202612312359]`，**如果使用带横杠等格式(如2024-01)会导致 arXiv 服务器直接 500 崩溃。**
+3. **字段前缀**：支持的字段前缀为 `ti:`(标题)、`au:`(作者)、`abs:`(摘要)、`cat:`(分类)、`all:`(所有)。布尔运算符必须大写（AND, OR, ANDNOT）。
+4. **分类正确性**：类别必须是正确的 arXiv 代码（如 `cs.AI`, `cs.CL`）。
+5. **检索范围过窄/空结果**：条件太多可能会返回空。考虑删除机构、名校等过于模糊主观的过滤词（arXiv 通常只保留正式的学术元数据，检索学校名称很容易匹配失败）。如果在结果为空之后重试，一定要放宽条件。
+6. **网络错误**：如果是真正的连接断开，可选择原样重试。
+
+## 输出要求
+请以严格的 JSON 格式输出，不要包含任何其他文本或 markdown 标记：
+{{
+  "error_analysis": "错误原因分析（中文）",
+  "fix_strategy": "修复策略（中文）",
+  "arxiv_query": "修正后的检索式",
+  "sort_by": "relevance 或 lastUpdatedDate 或 submittedDate",
+  "max_results": 10,
+  "should_retry": true,
+  "confidence": "对修复的信心程度：high / medium / low"
+}}

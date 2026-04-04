@@ -1,0 +1,27 @@
+你需要理解用户的论文检索需求，并构造一个精确的 arXiv API 检索式。
+
+## 用户需求
+{user_query}
+
+## 当前检索记忆（如有历史轮次）
+{search_memory}
+
+## arXiv 检索式语法说明
+- 字段前缀：ti（标题）、au（作者）、abs（摘要）、cat（类别）、all（全部字段）
+- 日期过滤：仅支持精确格式 `[YYYYMMDDHHMM TO YYYYMMDDHHMM]`，例如 `submittedDate:[202401010000 TO 202612312359]`。**严禁使用带横杠的格式(如2024-01-01)，否则会导致 arXiv API 崩溃(HTTP 500)**。
+- 模糊检索避坑：arXiv 元数据不包含标准化的机构/学校字段。如果查找“名牌大学的成果”，不要在检索式中加上类似 `all:"Stanford"` 这种限制，而是尽可能根据关键词进行宽泛检索并用自己的知识筛选。
+- 布尔运算符：AND、OR、ANDNOT（必须大写）。不要用嵌套过深的括号，容易引起解析失败。
+- 类别示例：cs.AI（人工智能）、cs.CL（计算语言学/NLP）、cs.LG（机器学习）等。
+- 示例：(ti:"large language model" OR abs:"LLM") AND submittedDate:[202401010000 TO 202612312359]
+
+## 输出要求
+请以严格的 JSON 格式输出，不要包含任何其他文本或 markdown 标记：
+{{
+  "understanding": "对用户需求的理解和分析（中文）",
+  "keywords": ["关键词1", "关键词2"],
+  "categories": ["cs.AI"],
+  "arxiv_query": "构造好的arXiv检索式字符串",
+  "sort_by": "relevance 或 lastUpdatedDate 或 submittedDate",
+  "max_results": 10,
+  "strategy": "检索策略说明（中文）"
+}}
