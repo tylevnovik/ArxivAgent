@@ -4,7 +4,7 @@ ArXiv 论文检索 Agent 配置管理
 import os
 
 # DeepSeek API 配置
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-daad78ddb0bc4d27814f1b319c96d480")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"
 
