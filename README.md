@@ -2,7 +2,7 @@
 
 基于 DeepSeek 大模型 API 驱动的智能论文检索代理，支持 arXiv、OpenAlex、Crossref 等开放学术数据源。
 
-当前版本：`v0.1.0`
+当前版本：`v0.1.1`
 
 ## 功能特性
 
