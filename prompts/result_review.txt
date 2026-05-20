@@ -1,4 +1,4 @@
-你需要审核以下 arXiv 检索结果，评估它们与用户需求的相关性。
+你需要审核以下多源论文检索结果，评估它们与用户需求的相关性。
 
 ## 用户原始需求
 {user_query}
@@ -16,24 +16,25 @@
 请对每篇论文进行相关性评分（1-5分），并判断整体检索质量是否满意。
 
 请以严格的 JSON 格式输出，不要包含任何其他文本或 markdown 标记：
-{{
+{
   "review_summary": "对本轮检索结果的整体评价（中文）",
   "relevant_papers": [
-    {{
+    {
       "index": 0,
       "title": "论文标题",
       "relevance_score": 5,
       "reason": "相关性说明（中文）"
-    }}
+    }
   ],
   "overall_quality": 0.8,
   "should_refine": false,
   "refine_reason": "如需优化，说明理由（中文）",
   "refine_suggestions": ["优化建议1", "优化建议2"]
-}}
+}
 
 注意：
 - overall_quality 是 0-1 的浮点数，0.7 以上视为满意
 - should_refine 为 true 表示建议进行下一轮优化检索
 - relevant_papers 中只包含相关性评分 >= 3 的论文
 - 如果检索结果为空或完全不相关，should_refine 应为 true
+- 检索结果可能来自 arXiv、OpenAlex、Crossref 等不同来源。请更看重标题、摘要和发表时间与用户需求的匹配，不要因为来源不同而降低评分

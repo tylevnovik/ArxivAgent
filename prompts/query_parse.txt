@@ -1,4 +1,4 @@
-你需要理解用户的论文检索需求，并构造一个精确的 arXiv API 检索式。
+你需要理解用户的论文检索需求，并构造一个精确的 arXiv API 检索式，同时给出可供 OpenAlex/Crossref 等通用学术检索源使用的核心关键词。
 
 ## 用户需求
 {user_query}
@@ -16,12 +16,12 @@
 
 ## 输出要求
 请以严格的 JSON 格式输出，不要包含任何其他文本或 markdown 标记：
-{{
+{
   "understanding": "对用户需求的理解和分析（中文）",
-  "keywords": ["关键词1", "关键词2"],
+  "keywords": ["可直接用于通用论文搜索API的英文关键词或短语1", "关键词2"],
   "categories": ["cs.AI"],
   "arxiv_query": "构造好的arXiv检索式字符串",
   "sort_by": "relevance 或 lastUpdatedDate 或 submittedDate",
   "max_results": 10,
   "strategy": "检索策略说明（中文）"
-}}
+}

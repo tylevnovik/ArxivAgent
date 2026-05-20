@@ -1,0 +1,1317 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔍 多源论文检索 Agent</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <!-- Marked.js Markdown Parser -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        :root[data-theme="light"] {
+            --bg-gradient: radial-gradient(circle at 50% 0%, #f8fafc 0%, #edf2f7 100%);
+            --bg-color: #edf2f7;
+            --text-primary: #0f172a;
+            --text-secondary: #334155;
+            --text-muted: #64748b;
+            --card-bg: rgba(255, 255, 255, 0.75);
+            --card-border: rgba(15, 23, 42, 0.08);
+            --input-bg: #ffffff;
+            --input-border: #cbd5e1;
+            --input-color: #0f172a;
+            --accent-primary: #4f46e5;
+            --accent-secondary: #7c3aed;
+            --brand-text: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+            --btn-primary-bg: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+            --btn-primary-hover: linear-gradient(135deg, #5a52e6 0%, #8b5cf6 100%);
+            --btn-primary-text: #ffffff;
+            --bot-bubble-bg: #e2e8f0;
+            --bot-bubble-text: #1e293b;
+            --bot-bubble-border: #cbd5e1;
+            --user-bubble-bg: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+            --user-bubble-text: #ffffff;
+            --topbar-bg: rgba(255, 255, 255, 0.7);
+            --scrollbar-thumb: rgba(0, 0, 0, 0.15);
+            --scrollbar-thumb-hover: rgba(0, 0, 0, 0.3);
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+            --status-bg: rgba(14, 165, 233, 0.1);
+            --status-text: #0284c7;
+            --status-border: rgba(14, 165, 233, 0.2);
+            --tab-active-bg: #ffffff;
+            --tab-inactive-text: #64748b;
+        }
+
+        :root[data-theme="dark"] {
+            --bg-gradient: radial-gradient(circle at 50% 0%, #171c2a 0%, #080b11 100%);
+            --bg-color: #080b11;
+            --text-primary: #f8fafc;
+            --text-secondary: #cbd5e1;
+            --text-muted: #94a3b8;
+            --card-bg: rgba(17, 24, 39, 0.4);
+            --card-border: rgba(255, 255, 255, 0.06);
+            --input-bg: rgba(10, 15, 30, 0.8);
+            --input-border: rgba(255, 255, 255, 0.06);
+            --input-color: #f8fafc;
+            --accent-primary: #a5b4fc;
+            --accent-secondary: #c084fc;
+            --brand-text: linear-gradient(135deg, #a5b4fc 0%, #c084fc 100%);
+            --btn-primary-bg: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+            --btn-primary-hover: linear-gradient(135deg, #5a52e6 0%, #8b5cf6 100%);
+            --btn-primary-text: #ffffff;
+            --bot-bubble-bg: rgba(17, 24, 39, 0.5);
+            --bot-bubble-text: #e2e8f0;
+            --bot-bubble-border: rgba(255, 255, 255, 0.06);
+            --user-bubble-bg: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+            --user-bubble-text: #ffffff;
+            --topbar-bg: rgba(10, 15, 30, 0.7);
+            --scrollbar-thumb: rgba(255, 255, 255, 0.1);
+            --scrollbar-thumb-hover: rgba(255, 255, 255, 0.2);
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -1px rgba(0, 0, 0, 0.2);
+            --status-bg: rgba(14, 165, 233, 0.06);
+            --status-text: #38bdf8;
+            --status-border: rgba(14, 165, 233, 0.2);
+            --tab-active-bg: rgba(17, 24, 39, 0.6);
+            --tab-inactive-text: #94a3b8;
+        }
+
+        * {
+            box-sizing: border-box;
+            transition: background-color 0.25s ease, border-color 0.25s ease, color 0.25s ease;
+        }
+
+        html {
+            height: 100%;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', 'Noto Sans SC', system-ui, sans-serif;
+            background: var(--bg-gradient) !important;
+            background-color: var(--bg-color) !important;
+            color: var(--text-primary);
+            height: 100vh;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+            overflow-y: hidden;
+        }
+
+        /* Scrollbar styles */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.03);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--scrollbar-thumb);
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--scrollbar-thumb-hover);
+        }
+
+        /* Header */
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 24px;
+            background: var(--topbar-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--card-border);
+            z-index: 100;
+            height: 64px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: baseline;
+            gap: 12px;
+        }
+
+        .brand h1 {
+            margin: 0;
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.35rem;
+            font-weight: 800;
+            background: var(--brand-text);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.5px;
+        }
+
+        .brand span {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
+        }
+
+        .actions-strip {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .source-tags {
+            display: flex;
+            gap: 6px;
+        }
+
+        .source-tags span {
+            font-size: 0.75rem;
+            padding: 3px 10px;
+            border-radius: 999px;
+            border: 1px solid var(--card-border);
+            background: var(--card-bg);
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .btn {
+            border: 1px solid var(--card-border);
+            background: var(--card-bg);
+            color: var(--text-primary);
+            padding: 6px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 0.85rem;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            box-shadow: var(--shadow);
+        }
+
+        .btn:hover {
+            border-color: var(--accent-primary);
+            color: var(--accent-primary);
+        }
+
+        .btn-primary {
+            background: var(--btn-primary-bg);
+            color: var(--btn-primary-text);
+            border: none;
+        }
+
+        .btn-primary:hover {
+            background: var(--btn-primary-hover);
+            color: var(--btn-primary-text);
+        }
+
+        .btn-danger {
+            color: #ef4444;
+            border-color: rgba(239, 68, 68, 0.2);
+            background: rgba(239, 68, 68, 0.05);
+        }
+
+        .btn-danger:hover {
+            background: #ef4444;
+            color: #ffffff;
+            border-color: #ef4444;
+        }
+
+        /* Config Bar */
+        .config-bar {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 8px 24px;
+            background: rgba(0, 0, 0, 0.02);
+            border-bottom: 1px solid var(--card-border);
+            height: 48px;
+        }
+
+        .config-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex: 1;
+        }
+
+        .config-item label {
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+
+        .config-input {
+            width: 100%;
+            max-width: 320px;
+            background: var(--input-bg);
+            border: 1px solid var(--input-border);
+            color: var(--input-color);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            outline: none;
+        }
+
+        .config-input:focus {
+            border-color: var(--accent-primary);
+        }
+
+        .status-pill {
+            background: var(--status-bg);
+            border: 1px solid var(--status-border);
+            color: var(--status-text);
+            padding: 4px 12px;
+            border-radius: 999px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            max-width: 500px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            animation: pulse 1.8s infinite ease-in-out;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 0.3; transform: scale(0.8); }
+            50% { opacity: 1; transform: scale(1.1); }
+            100% { opacity: 0.3; transform: scale(0.8); }
+        }
+
+        /* Main Workspace Container */
+        .workspace {
+            display: flex;
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow: hidden;
+            padding: 16px 24px;
+            gap: 16px;
+        }
+
+        .panel {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        .panel-left {
+            flex: 6;
+            min-width: 450px;
+        }
+
+        .panel-right {
+            flex: 5;
+            min-width: 400px;
+        }
+
+        /* Left Panel - Chat interface */
+        .chat-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--card-border);
+            font-weight: 600;
+            font-size: 0.95rem;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .chat-messages {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            overscroll-behavior: contain;
+        }
+
+        .message {
+            max-width: 92%;
+            padding: 12px 16px;
+            border-radius: 12px;
+            line-height: 1.5;
+            font-size: 0.9rem;
+            word-wrap: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .message-user {
+            align-self: flex-end;
+            background: var(--user-bubble-bg);
+            color: var(--user-bubble-text);
+            border-bottom-right-radius: 2px;
+        }
+
+        .message-bot {
+            align-self: flex-start;
+            background: var(--bot-bubble-bg);
+            color: var(--bot-bubble-text);
+            border: 1px solid var(--bot-bubble-border);
+            border-bottom-left-radius: 2px;
+        }
+
+        .message-bot pre {
+            background: rgba(0, 0, 0, 0.05);
+            padding: 10px;
+            border-radius: 6px;
+            overflow: auto;
+            font-family: monospace;
+            font-size: 0.85rem;
+            margin: 8px 0;
+            max-height: 260px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .message-bot blockquote {
+            margin: 6px 0;
+            padding-left: 10px;
+            border-left: 3px solid var(--accent-primary);
+            color: var(--text-muted);
+        }
+
+        .composer {
+            padding: 12px 16px;
+            border-top: 1px solid var(--card-border);
+            display: flex;
+            gap: 12px;
+            background: rgba(0, 0, 0, 0.01);
+        }
+
+        .composer textarea {
+            flex: 1;
+            background: var(--input-bg);
+            border: 1px solid var(--input-border);
+            color: var(--input-color);
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 0.9rem;
+            resize: none;
+            height: 60px;
+            outline: none;
+            font-family: inherit;
+        }
+
+        .composer textarea:focus {
+            border-color: var(--accent-primary);
+        }
+
+        .composer .btn-send {
+            height: 60px;
+            width: 70px;
+            justify-content: center;
+            font-size: 0.95rem;
+        }
+
+        /* Right Panel - Tabs & Displays */
+        .tabs {
+            display: flex;
+            background: rgba(0, 0, 0, 0.02);
+            border-bottom: 1px solid var(--card-border);
+            padding: 4px 8px 0;
+        }
+
+        .tab-button {
+            border: none;
+            background: none;
+            color: var(--tab-inactive-text);
+            padding: 10px 16px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            margin-bottom: -1px;
+            border-bottom: 2px solid transparent;
+        }
+
+        .tab-button.active {
+            color: var(--accent-primary);
+            background: var(--tab-active-bg);
+            border-bottom: 2px solid var(--accent-primary);
+            border-left: 1px solid var(--card-border);
+            border-right: 1px solid var(--card-border);
+            border-top: 1px solid var(--card-border);
+        }
+
+        .tab-content {
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 20px;
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .markdown-body {
+            line-height: 1.6;
+            font-size: 0.92rem;
+            color: var(--text-secondary);
+        }
+
+        .markdown-body h1, .markdown-body h2, .markdown-body h3 {
+            color: var(--text-primary);
+            margin-top: 1.5em;
+            margin-bottom: 0.5em;
+            font-weight: 700;
+        }
+
+        .markdown-body h3 {
+            font-size: 1.1rem;
+            border-bottom: 1px solid var(--card-border);
+            padding-bottom: 6px;
+        }
+
+        .markdown-body a {
+            color: var(--accent-primary);
+            text-decoration: none;
+        }
+
+        .markdown-body a:hover {
+            text-decoration: underline;
+        }
+
+        .markdown-body blockquote {
+            margin: 10px 0;
+            padding: 8px 12px;
+            background: rgba(0, 0, 0, 0.02);
+            border-left: 4px solid var(--accent-primary);
+            color: var(--text-muted);
+            border-radius: 4px;
+        }
+
+        .markdown-body ul, .markdown-body ol {
+            padding-left: 20px;
+        }
+
+        .markdown-body pre {
+            max-height: 360px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .markdown-body table {
+            display: block;
+            max-width: 100%;
+            overflow-x: auto;
+            border-collapse: collapse;
+        }
+
+        .markdown-body code {
+            overflow-wrap: anywhere;
+        }
+
+        /* Export Bar (Bottom of workspace or inside left panel) */
+        .export-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 16px;
+            border-top: 1px solid var(--card-border);
+            background: rgba(0, 0, 0, 0.01);
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .export-btns {
+            display: flex;
+            gap: 6px;
+        }
+
+        /* Modal Overlay & Container */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.25s ease;
+        }
+
+        .modal-overlay.active {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .modal-content {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            width: 90%;
+            max-width: 480px;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 24px;
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            transform: scale(0.95);
+            transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .modal-section-title {
+            font-size: 0.92rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            border-top: 1px solid var(--card-border);
+            padding-top: 16px;
+            margin: 8px 0 4px 0;
+        }
+
+        .modal-overlay.active .modal-content {
+            transform: scale(1);
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--card-border);
+            padding-bottom: 12px;
+        }
+
+        .modal-header h2 {
+            margin: 0;
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.5rem;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0;
+        }
+
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .form-group label {
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+        }
+
+        .form-select, .form-input {
+            background: var(--input-bg);
+            border: 1px solid var(--input-border);
+            color: var(--input-color);
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 0.88rem;
+            outline: none;
+            width: 100%;
+            box-sizing: border-box;
+            transition: border-color 0.2s;
+        }
+
+        .form-select:focus, .form-input:focus {
+            border-color: var(--accent-primary);
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            border-top: 1px solid var(--card-border);
+            padding-top: 16px;
+            margin-top: 8px;
+        }
+
+        /* Responsive Layout */
+        @media (max-width: 992px) {
+            body {
+                height: auto;
+                overflow-y: auto;
+            }
+            .workspace {
+                flex-direction: column;
+                height: auto;
+                overflow: visible;
+                padding: 10px;
+            }
+            .panel {
+                height: 500px;
+                min-width: 0;
+            }
+            .topbar {
+                flex-direction: column;
+                height: auto;
+                gap: 10px;
+                padding: 12px;
+            }
+            .config-bar {
+                flex-direction: column;
+                height: auto;
+                padding: 12px;
+                gap: 10px;
+            }
+            .config-item {
+                width: 100%;
+            }
+            .config-input {
+                max-width: none;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Topbar -->
+    <div class="topbar">
+        <div class="brand">
+            <h1>多源论文检索 Agent</h1>
+            <span>v0.1.0</span>
+        </div>
+        <div class="actions-strip">
+            <div class="source-tags">
+                <span>arXiv</span>
+                <span>OpenAlex</span>
+                <span>Crossref</span>
+                <span>Semantic Scholar</span>
+            </div>
+            <button id="theme-toggle" class="btn" onclick="toggleTheme()">
+                🌙 深色模式
+            </button>
+        </div>
+    </div>
+
+    <!-- Configuration & Status -->
+    <div class="config-bar">
+        <div id="status-container" class="status-pill" style="max-width: none; flex: 1;">
+            <div class="status-dot"></div>
+            <span id="status-text">就绪，等待输入...</span>
+        </div>
+        <button id="settings-btn" class="btn" style="padding: 4px 12px; height: 32px;" onclick="toggleSettingsModal(true)">
+            ⚙️ 模型配置
+        </button>
+    </div>
+
+    <!-- Workspace Grid -->
+    <div class="workspace">
+        <!-- Left Panel: Chat -->
+        <div class="panel panel-left">
+            <div class="chat-header">
+                <span>对话与检索工作流</span>
+                <span style="font-size: 0.8rem; font-weight: normal; color: var(--text-muted);">流式输出</span>
+            </div>
+            <div id="chat-messages" class="chat-messages">
+                <div class="message message-bot">
+                    👋 你好！我是您的多源论文检索 Agent。
+                    请在此用中文输入您的检索需求，例如：
+                    <br><em>“帮我找 2024 年关于大语言模型对齐（alignment）的最新论文”</em>
+                </div>
+            </div>
+            <div class="composer">
+                <textarea id="user-input" placeholder="输入您的检索需求... (按 Enter 发送，Shift+Enter 换行)"></textarea>
+                <button id="send-btn" class="btn btn-primary btn-send" onclick="sendQuery()">发送</button>
+            </div>
+            <div class="export-bar">
+                <div class="export-btns">
+                    <button class="btn" onclick="exportData('chat')">导出对话</button>
+                    <button class="btn" onclick="exportData('md')">导出 MD</button>
+                    <button class="btn" onclick="exportData('csv')">导出 CSV</button>
+                    <button class="btn" onclick="exportData('json')">导出 JSON</button>
+                    <button class="btn" onclick="exportData('report')">导出报告</button>
+                </div>
+                <button class="btn btn-danger" onclick="clearAllData()">清除全部</button>
+            </div>
+        </div>
+
+        <!-- Right Panel: Results & Reports -->
+        <div class="panel panel-right">
+            <div class="tabs">
+                <button id="tab-btn-results" class="tab-button active" onclick="switchTab('results')">检索结果</button>
+                <button id="tab-btn-report" class="tab-button" onclick="switchTab('report')">最终报告</button>
+            </div>
+            <div id="tab-results" class="tab-content active">
+                <div id="results-display" class="markdown-body">
+                    <em>暂无检索结果，请在左侧输入需求并启动检索。</em>
+                </div>
+            </div>
+            <div id="tab-report" class="tab-content">
+                <div id="report-display" class="markdown-body">
+                    <em>报告生成中或尚未开始...</em>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hidden Downloader Frame -->
+    <iframe id="downloader" style="display:none;"></iframe>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal-overlay" onclick="toggleSettingsModal(false)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h2>⚙️ 配置中心</h2>
+                <button class="modal-close" onclick="toggleSettingsModal(false)">&times;</button>
+            </div>
+            
+            <div class="modal-section-title" style="border-top: none; padding-top: 0; margin-top: 0;">LLM 模型配置</div>
+
+            <div class="form-group">
+                <label for="model-provider">模型厂商 (Provider)</label>
+                <select id="model-provider" class="form-select" onchange="onProviderChange()">
+                    <option value="deepseek">DeepSeek</option>
+                    <option value="openai">OpenAI 兼容 (自定义)</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="api-endpoint">API 端点 (Base URL)</label>
+                <input type="text" id="api-endpoint" class="form-input" placeholder="例如: https://api.deepseek.com">
+            </div>
+
+            <div class="form-group">
+                <label for="settings-api-key">API Key</label>
+                <input type="password" id="settings-api-key" class="form-input" placeholder="留空则使用本地环境变量">
+            </div>
+
+            <div class="form-group">
+                <label for="model-name">模型名称 (Model Name)</label>
+                <input type="text" id="model-name" class="form-input" placeholder="例如: deepseek-v4-flash">
+            </div>
+
+            <div class="modal-section-title">Agent 检索配置</div>
+
+            <div class="form-group">
+                <label for="max-search-rounds">最大检索迭代轮次 (Max Search Rounds)</label>
+                <input type="number" id="max-search-rounds" class="form-input" min="1" max="10" placeholder="默认: 3">
+            </div>
+
+            <div class="form-group">
+                <label for="max-results-per-round">每轮最大返回结果数 (Max Results per Round)</label>
+                <input type="number" id="max-results-per-round" class="form-input" min="1" max="50" placeholder="默认: 10">
+            </div>
+
+            <div class="form-group">
+                <label>启用文献检索源 (Search Providers)</label>
+                <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-top: 4px;">
+                    <label style="display: flex; align-items: center; gap: 4px; font-weight: normal; cursor: pointer; color: var(--text-secondary); font-size: 0.85rem;">
+                        <input type="checkbox" id="provider-arxiv" value="arxiv"> arXiv
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 4px; font-weight: normal; cursor: pointer; color: var(--text-secondary); font-size: 0.85rem;">
+                        <input type="checkbox" id="provider-openalex" value="openalex"> OpenAlex
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 4px; font-weight: normal; cursor: pointer; color: var(--text-secondary); font-size: 0.85rem;">
+                        <input type="checkbox" id="provider-crossref" value="crossref"> Crossref
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 4px; font-weight: normal; cursor: pointer; color: var(--text-secondary); font-size: 0.85rem;">
+                        <input type="checkbox" id="provider-semantic_scholar" value="semantic_scholar"> Semantic Scholar
+                    </label>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label for="openalex-mailto">OpenAlex Mailto</label>
+                <input type="email" id="openalex-mailto" class="form-input" placeholder="建议填写邮箱以使用 polite pool">
+            </div>
+
+            <div class="form-group">
+                <label for="crossref-mailto">Crossref Mailto</label>
+                <input type="email" id="crossref-mailto" class="form-input" placeholder="建议填写邮箱以获得更稳定访问">
+            </div>
+
+            <div class="form-group">
+                <label for="semantic-scholar-api-key">Semantic Scholar API Key</label>
+                <input type="password" id="semantic-scholar-api-key" class="form-input" placeholder="可选，留空则使用本地环境变量">
+            </div>
+
+            <div class="modal-footer">
+                <button class="btn" onclick="toggleSettingsModal(false)">取消</button>
+                <button class="btn btn-primary" onclick="saveSettings()">保存配置</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Init state
+        let session_id = localStorage.getItem('arxiv_agent_session_id');
+        if (!session_id) {
+            session_id = Math.random().toString(36).substring(2) + Date.now().toString(36);
+            localStorage.setItem('arxiv_agent_session_id', session_id);
+        }
+
+        let chatHistory = [];
+        let isSearching = false;
+
+        // Theme Manager
+        const savedTheme = localStorage.getItem('arxiv-agent-theme');
+        const systemPrefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        const currentTheme = savedTheme || (systemPrefersDark ? 'dark' : 'light');
+        document.documentElement.setAttribute('data-theme', currentTheme);
+        updateThemeButton(currentTheme);
+
+        function toggleTheme() {
+            const current = document.documentElement.getAttribute('data-theme') || 'light';
+            const next = current === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', next);
+            localStorage.setItem('arxiv-agent-theme', next);
+            updateThemeButton(next);
+        }
+
+        function updateThemeButton(theme) {
+            const btn = document.getElementById('theme-toggle');
+            if (btn) {
+                btn.innerHTML = theme === 'dark' ? '☀️ 浅色模式' : '🌙 深色模式';
+            }
+        }
+
+        // Settings Manager
+        function toggleSettingsModal(show) {
+            const modal = document.getElementById('settings-modal');
+            if (show) {
+                // Populate inputs from localStorage
+                document.getElementById('model-provider').value = localStorage.getItem('arxiv_agent_provider') || 'deepseek';
+                document.getElementById('api-endpoint').value = localStorage.getItem('arxiv_agent_endpoint') || 'https://api.deepseek.com';
+                document.getElementById('settings-api-key').value = localStorage.getItem('arxiv_agent_api_key') || '';
+                document.getElementById('model-name').value = localStorage.getItem('arxiv_agent_model_name') || 'deepseek-v4-flash';
+                
+                // Agent settings
+                document.getElementById('max-search-rounds').value = localStorage.getItem('arxiv_agent_max_search_rounds') || '3';
+                document.getElementById('max-results-per-round').value = localStorage.getItem('arxiv_agent_max_results_per_round') || '10';
+                
+                const providersStr = localStorage.getItem('arxiv_agent_providers') || 'arxiv,openalex,crossref';
+                const providers = providersStr.split(',');
+                document.getElementById('provider-arxiv').checked = providers.includes('arxiv');
+                document.getElementById('provider-openalex').checked = providers.includes('openalex');
+                document.getElementById('provider-crossref').checked = providers.includes('crossref');
+                document.getElementById('provider-semantic_scholar').checked = providers.includes('semantic_scholar');
+
+                document.getElementById('openalex-mailto').value = localStorage.getItem('arxiv_agent_openalex_mailto') || '';
+                document.getElementById('crossref-mailto').value = localStorage.getItem('arxiv_agent_crossref_mailto') || '';
+                document.getElementById('semantic-scholar-api-key').value = localStorage.getItem('arxiv_agent_semantic_scholar_api_key') || '';
+                
+                modal.classList.add('active');
+            } else {
+                modal.classList.remove('active');
+            }
+        }
+
+        function onProviderChange() {
+            const provider = document.getElementById('model-provider').value;
+            const endpointInput = document.getElementById('api-endpoint');
+            const modelInput = document.getElementById('model-name');
+            
+            if (provider === 'deepseek') {
+                endpointInput.value = 'https://api.deepseek.com';
+                modelInput.value = 'deepseek-v4-flash';
+            } else if (provider === 'openai') {
+                endpointInput.value = 'https://api.openai.com/v1';
+                modelInput.value = 'gpt-4o';
+            }
+        }
+
+        function saveSettings() {
+            const provider = document.getElementById('model-provider').value;
+            const endpoint = document.getElementById('api-endpoint').value.trim();
+            const apiKey = document.getElementById('settings-api-key').value.trim();
+            const modelName = document.getElementById('model-name').value.trim();
+
+            const maxRounds = document.getElementById('max-search-rounds').value.trim() || '3';
+            const maxResults = document.getElementById('max-results-per-round').value.trim() || '10';
+            const openalexMailto = document.getElementById('openalex-mailto').value.trim();
+            const crossrefMailto = document.getElementById('crossref-mailto').value.trim();
+            const semanticScholarApiKey = document.getElementById('semantic-scholar-api-key').value.trim();
+
+            const providers = [];
+            if (document.getElementById('provider-arxiv').checked) providers.push('arxiv');
+            if (document.getElementById('provider-openalex').checked) providers.push('openalex');
+            if (document.getElementById('provider-crossref').checked) providers.push('crossref');
+            if (document.getElementById('provider-semantic_scholar').checked) providers.push('semantic_scholar');
+            if (providers.length === 0) {
+                providers.push('arxiv');
+                document.getElementById('provider-arxiv').checked = true;
+            }
+
+            localStorage.setItem('arxiv_agent_provider', provider);
+            localStorage.setItem('arxiv_agent_endpoint', endpoint);
+            localStorage.setItem('arxiv_agent_api_key', apiKey);
+            localStorage.setItem('arxiv_agent_model_name', modelName);
+            localStorage.setItem('arxiv_agent_max_search_rounds', maxRounds);
+            localStorage.setItem('arxiv_agent_max_results_per_round', maxResults);
+            localStorage.setItem('arxiv_agent_providers', providers.join(','));
+            localStorage.setItem('arxiv_agent_openalex_mailto', openalexMailto);
+            localStorage.setItem('arxiv_agent_crossref_mailto', crossrefMailto);
+            localStorage.setItem('arxiv_agent_semantic_scholar_api_key', semanticScholarApiKey);
+
+            toggleSettingsModal(false);
+            
+            // Temporary visual feedback
+            const origText = document.getElementById('status-text').innerText;
+            document.getElementById('status-text').innerText = '⚡ 配置已成功保存！';
+            setTimeout(() => {
+                document.getElementById('status-text').innerText = origText;
+            }, 1500);
+        }
+
+        // Initialize default settings in localStorage if empty
+        if (!localStorage.getItem('arxiv_agent_provider')) {
+            localStorage.setItem('arxiv_agent_provider', 'deepseek');
+            localStorage.setItem('arxiv_agent_endpoint', 'https://api.deepseek.com');
+            localStorage.setItem('arxiv_agent_model_name', 'deepseek-v4-flash');
+        }
+        if (localStorage.getItem('arxiv_agent_model_name') === 'deepseek-chat') {
+            localStorage.setItem('arxiv_agent_model_name', 'deepseek-v4-flash');
+        }
+        if (!localStorage.getItem('arxiv_agent_max_search_rounds')) {
+            localStorage.setItem('arxiv_agent_max_search_rounds', '3');
+        }
+        if (!localStorage.getItem('arxiv_agent_max_results_per_round')) {
+            localStorage.setItem('arxiv_agent_max_results_per_round', '10');
+        }
+        if (!localStorage.getItem('arxiv_agent_providers')) {
+            localStorage.setItem('arxiv_agent_providers', 'arxiv,openalex,crossref');
+        }
+
+        // Tab Switcher
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+
+            if (tabName === 'results') {
+                document.getElementById('tab-btn-results').classList.add('active');
+                document.getElementById('tab-results').classList.add('active');
+            } else if (tabName === 'report') {
+                document.getElementById('tab-btn-report').classList.add('active');
+                document.getElementById('tab-report').classList.add('active');
+            }
+        }
+
+        // Render Markdown safely helper
+        function renderMarkdown(mdText) {
+            if (!mdText || mdText.trim() === "") return "";
+            try {
+                return marked.parse(mdText);
+            } catch (e) {
+                console.error("Markdown parse error", e);
+                return mdText;
+            }
+        }
+
+        // Textarea auto enter submit
+        document.getElementById('user-input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendQuery();
+            }
+        });
+
+        function isNearBottom(container, threshold = 120) {
+            return container.scrollHeight - container.scrollTop - container.clientHeight < threshold;
+        }
+
+        function scrollToBottom(container) {
+            container.scrollTop = container.scrollHeight;
+            requestAnimationFrame(() => {
+                container.scrollTop = container.scrollHeight;
+                setTimeout(() => {
+                    container.scrollTop = container.scrollHeight;
+                }, 50);
+            });
+        }
+
+        function waitForPaint() {
+            return new Promise(resolve => requestAnimationFrame(resolve));
+        }
+
+        // Add a message bubble to the chat container
+        function appendMessage(role, content, id = null, shouldScroll = true) {
+            const container = document.getElementById('chat-messages');
+            const div = document.createElement('div');
+            div.className = `message ${role === 'user' ? 'message-user' : 'message-bot'}`;
+            if (id) div.id = id;
+            div.innerHTML = renderMarkdown(content);
+            container.appendChild(div);
+            if (shouldScroll) scrollToBottom(container);
+            return div;
+        }
+
+        function renderChatHistory(history, forceScroll = false) {
+            const container = document.getElementById('chat-messages');
+            const shouldScroll = forceScroll || isNearBottom(container);
+
+            if (!history || history.length === 0) {
+                container.innerHTML = '';
+                appendMessage('assistant', '👋 你好！我是您的多源论文检索 Agent。请在此用中文输入您的检索需求。', null, false);
+            } else {
+                container.querySelectorAll('.message:not([data-message-index])').forEach(el => el.remove());
+
+                history.forEach((msg, index) => {
+                    const role = msg.role === 'user' ? 'user' : 'assistant';
+                    const content = msg.content || '';
+                    let bubble = container.querySelector(`.message[data-message-index="${index}"]`);
+
+                    if (!bubble) {
+                        bubble = document.createElement('div');
+                        bubble.dataset.messageIndex = String(index);
+                        container.appendChild(bubble);
+                    }
+
+                    const nextClass = `message ${role === 'user' ? 'message-user' : 'message-bot'}`;
+                    if (bubble.className !== nextClass) {
+                        bubble.className = nextClass;
+                    }
+
+                    if (bubble.dataset.rawContent !== content) {
+                        bubble.innerHTML = renderMarkdown(content);
+                        bubble.dataset.rawContent = content;
+                    }
+                });
+
+                container.querySelectorAll('.message[data-message-index]').forEach(el => {
+                    if (Number(el.dataset.messageIndex) >= history.length) {
+                        el.remove();
+                    }
+                });
+            }
+
+            if (shouldScroll) scrollToBottom(container);
+        }
+
+        function updateMarkdownPanel(elementId, markdownText) {
+            const el = document.getElementById(elementId);
+            const scrollParent = el.closest('.tab-content');
+            const shouldScroll = scrollParent ? isNearBottom(scrollParent, 160) : false;
+            el.innerHTML = renderMarkdown(markdownText);
+            if (scrollParent && shouldScroll) scrollToBottom(scrollParent);
+        }
+
+        // Main Query Submit (Streams using fetch & text reader)
+        async function sendQuery() {
+            if (isSearching) return;
+            const inputEl = document.getElementById('user-input');
+            const query = inputEl.value.trim();
+            if (!query) return;
+
+            const apiKey = localStorage.getItem('arxiv_agent_api_key') || '';
+            const baseUrl = localStorage.getItem('arxiv_agent_endpoint') || '';
+            const modelName = localStorage.getItem('arxiv_agent_model_name') || '';
+            const openalexMailto = localStorage.getItem('arxiv_agent_openalex_mailto') || '';
+            const crossrefMailto = localStorage.getItem('arxiv_agent_crossref_mailto') || '';
+            const semanticScholarApiKey = localStorage.getItem('arxiv_agent_semantic_scholar_api_key') || '';
+
+            const maxRoundsStr = localStorage.getItem('arxiv_agent_max_search_rounds') || '3';
+            const maxResultsStr = localStorage.getItem('arxiv_agent_max_results_per_round') || '10';
+            const providersStr = localStorage.getItem('arxiv_agent_providers') || 'arxiv,openalex,crossref';
+            
+            const maxRounds = parseInt(maxRoundsStr, 10);
+            const maxResults = parseInt(maxResultsStr, 10);
+            const providers = providersStr ? providersStr.split(',') : [];
+
+            // Clear input and change state
+            inputEl.value = "";
+            isSearching = true;
+            document.getElementById('send-btn').disabled = true;
+            document.getElementById('status-container').style.display = 'flex';
+            document.getElementById('status-text').innerText = '正在初始化 Agent...';
+
+            const requestHistory = chatHistory.slice();
+            chatHistory = [...requestHistory, { role: 'user', content: query }];
+            renderChatHistory(chatHistory, true);
+
+            // Placeholder for stream response
+            const botMessageId = 'bot-msg-' + Date.now();
+            appendMessage('assistant', '⏳ 正在连接 Agent...', botMessageId);
+
+            try {
+                const response = await fetch('/api/search', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        query: query,
+                        api_key: apiKey,
+                        base_url: baseUrl,
+                        model: modelName,
+                        max_search_rounds: maxRounds,
+                        max_results_per_round: maxResults,
+                        providers: providers,
+                        openalex_mailto: openalexMailto,
+                        crossref_mailto: crossrefMailto,
+                        semantic_scholar_api_key: semanticScholarApiKey,
+                        history: requestHistory,
+                        session_id: session_id
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP 异常 ${response.status}`);
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // Keep remaining incomplete line in buffer
+
+                    for (const line of lines) {
+                        if (line.trim()) {
+                            try {
+                                const data = JSON.parse(line);
+                                let changed = false;
+
+                                // Update Status Pill
+                                if (data.status_text) {
+                                    document.getElementById('status-text').innerText = data.status_text;
+                                    changed = true;
+                                }
+
+                                // Update Search Results Tab
+                                if (data.papers_md) {
+                                    updateMarkdownPanel('results-display', data.papers_md);
+                                    changed = true;
+                                }
+
+                                // Update Final Report Tab
+                                if (data.final_md) {
+                                    updateMarkdownPanel('report-display', data.final_md);
+                                    changed = true;
+                                }
+
+                                // Update current chat history and redraw the whole thread.
+                                if (data.chat_history && data.chat_history.length > 0) {
+                                    chatHistory = data.chat_history;
+                                    renderChatHistory(chatHistory, true);
+                                    changed = true;
+                                }
+
+                                if (changed) {
+                                    await waitForPaint();
+                                }
+                            } catch (err) {
+                                console.warn("Failed to parse JSON stream line", err, line);
+                            }
+                        }
+                    }
+                }
+            } catch (err) {
+                console.error("Streaming error", err);
+                const pending = document.getElementById(botMessageId);
+                const errorHtml = `<span style="color: #ef4444;">❌ 出现错误: ${err.message}</span>`;
+                if (pending) {
+                    pending.innerHTML = errorHtml;
+                } else {
+                    appendMessage('assistant', errorHtml);
+                }
+                document.getElementById('status-text').innerText = '网络连接异常';
+            } finally {
+                isSearching = false;
+                document.getElementById('send-btn').disabled = false;
+            }
+        }
+
+        // Export Data Trigger
+        async function exportData(type) {
+            document.getElementById('status-text').innerText = `正在导出 ${type.toUpperCase()}...`;
+            try {
+                const response = await fetch('/api/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: type,
+                        history: chatHistory,
+                        session_id: session_id
+                    })
+                });
+                const result = await response.json();
+                if (result.success && result.filename) {
+                    document.getElementById('status-text').innerText = result.status || '导出成功！';
+                    // Trigger browser download via hidden iframe
+                    document.getElementById('downloader').src = `/api/download?file=${encodeURIComponent(result.filename)}`;
+                } else {
+                    alert(result.status || '导出失败');
+                    document.getElementById('status-text').innerText = result.status || '导出失败';
+                }
+            } catch (err) {
+                console.error(err);
+                alert("导出请求失败，网络异常");
+            }
+        }
+
+        // Reset/Clear All
+        async function clearAllData() {
+            if (!confirm("确定要清空所有对话和检索记录吗？这会同时重置 Agent 的记忆。")) return;
+            document.getElementById('status-text').innerText = '正在清除数据...';
+            try {
+                await fetch('/api/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: session_id })
+                });
+
+                chatHistory = [];
+                document.getElementById('chat-messages').innerHTML = `
+                    <div class="message message-bot">
+                        👋 数据已清空。您可以开始新的论文检索任务了。
+                    </div>
+                `;
+                document.getElementById('results-display').innerHTML = '<em>暂无检索结果，请在左侧输入需求并启动检索。</em>';
+                document.getElementById('report-display').innerHTML = '<em>报告生成中或尚未开始...</em>';
+                document.getElementById('status-text').innerText = '就绪，等待输入...';
+                switchTab('results');
+            } catch (err) {
+                console.error(err);
+                alert("清除数据失败，请刷新页面重试。");
+            }
+        }
+    </script>
+</body>
+</html>

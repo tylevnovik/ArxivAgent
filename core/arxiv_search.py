@@ -5,6 +5,7 @@ arXiv API 检索封装模块
 import time
 import requests
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from typing import Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -24,6 +25,7 @@ class SearchErrorType(Enum):
     NETWORK = "network"           # 网络连接错误
     TIMEOUT = "timeout"           # 超时
     HTTP_ERROR = "http_error"     # HTTP 错误码
+    RATE_LIMIT = "rate_limit"     # API 限流
     PARSE_ERROR = "parse_error"   # XML 解析错误
     EMPTY_RESULT = "empty_result" # 结果为空
     QUERY_SYNTAX = "query_syntax" # 检索式语法错误
@@ -94,8 +96,32 @@ def search(
                 "sortOrder": sort_order,
             }
 
-            response = requests.get(config.ARXIV_API_URL, params=params, timeout=30)
+            headers = {
+                "User-Agent": "ArxivAgent/1.0 (contact: info@arxivagent.org)"
+            }
+            response = requests.get(
+                config.ARXIV_API_URL,
+                params=params,
+                headers=headers,
+                timeout=getattr(config, "SEARCH_PROVIDER_TIMEOUT_SECONDS", 30),
+            )
             _last_request_time = time.time()
+
+            # arXiv 限流有时返回 429，有时返回 200 + 纯文本 "Rate exceeded."
+            if _is_rate_limited(response):
+                wait_seconds = _retry_after_seconds(response, retry_delay * (attempt + 1))
+                error = SearchError(
+                    error_type=SearchErrorType.RATE_LIMIT,
+                    message=f"arXiv API 触发限流，建议等待 {wait_seconds:.0f} 秒后重试",
+                    http_status=response.status_code,
+                    raw_response=response.text[:500],
+                    recoverable=False,
+                )
+                if attempt < max_retries:
+                    last_error = error
+                    time.sleep(max(wait_seconds, config.ARXIV_RATE_LIMIT_SECONDS))
+                    continue
+                return SearchResult(success=False, papers=[], error=error, query_used=query)
 
             # HTTP 错误
             if response.status_code != 200:
@@ -165,18 +191,24 @@ def search(
             last_error = SearchError(
                 error_type=SearchErrorType.TIMEOUT,
                 message=f"arXiv API 请求超时（第 {attempt + 1} 次尝试）",
-                recoverable=True,
+                recoverable=attempt < max_retries,
             )
             if attempt < max_retries:
                 time.sleep(retry_delay * (attempt + 1))
                 continue
 
         except requests.exceptions.ConnectionError as e:
-            last_error = SearchError(
-                error_type=SearchErrorType.NETWORK,
-                message=f"网络连接错误: {e}",
-                recoverable=True,
-            )
+            if last_error and last_error.error_type == SearchErrorType.RATE_LIMIT:
+                last_error.message = (
+                    f"{last_error.message}；后续连接被服务器关闭，仍按限流处理"
+                )
+                last_error.recoverable = False
+            else:
+                last_error = SearchError(
+                    error_type=SearchErrorType.NETWORK,
+                    message=f"网络连接错误: {e}",
+                    recoverable=attempt < max_retries,
+                )
             if attempt < max_retries:
                 time.sleep(retry_delay * (attempt + 1))
                 continue
@@ -219,6 +251,32 @@ def _check_api_error(xml_text: str) -> bool:
         return False
     except ET.ParseError:
         return True
+
+
+def _is_rate_limited(response: requests.Response) -> bool:
+    """判断 arXiv 是否返回了限流响应。"""
+    if response.status_code == 429:
+        return True
+    content_type = response.headers.get("Content-Type", "")
+    body_preview = response.text[:100].strip().lower()
+    return "xml" not in content_type.lower() and "rate exceeded" in body_preview
+
+
+def _retry_after_seconds(response: requests.Response, fallback: float) -> float:
+    """解析 Retry-After；没有可靠值时使用递增退避。"""
+    header = response.headers.get("Retry-After", "").strip()
+    if not header:
+        return fallback
+    try:
+        return max(float(header), fallback)
+    except ValueError:
+        pass
+
+    try:
+        retry_at = parsedate_to_datetime(header)
+        return max(retry_at.timestamp() - time.time(), fallback)
+    except (TypeError, ValueError, OSError):
+        return fallback
 
 
 def _extract_api_error(xml_text: str) -> str:
@@ -331,13 +389,20 @@ def format_papers_for_llm(papers: list[dict]) -> str:
     lines = []
     for i, paper in enumerate(papers):
         lines.append(f"--- 论文 {i + 1} ---")
-        lines.append(f"标题: {paper['title']}")
-        lines.append(f"作者: {', '.join(paper['authors'][:5])}" +
-                     (f" 等共{len(paper['authors'])}人" if len(paper['authors']) > 5 else ""))
-        lines.append(f"类别: {', '.join(paper['categories'][:3])}")
-        lines.append(f"发表日期: {paper['published'][:10]}")
-        lines.append(f"摘要: {paper['abstract'][:300]}...")
-        lines.append(f"链接: {paper['link']}")
+        authors = paper.get("authors", [])
+        categories = paper.get("categories", [])
+        lines.append(f"标题: {paper.get('title', '无标题')}")
+        lines.append(f"来源: {paper.get('source', 'arxiv')}")
+        if paper.get("doi"):
+            lines.append(f"DOI: {paper['doi']}")
+        if paper.get("citation_count"):
+            lines.append(f"引用数: {paper['citation_count']}")
+        lines.append(f"作者: {', '.join(authors[:5])}" +
+                     (f" 等共{len(authors)}人" if len(authors) > 5 else ""))
+        lines.append(f"类别: {', '.join(categories[:3])}")
+        lines.append(f"发表日期: {paper.get('published', '')[:10]}")
+        lines.append(f"摘要: {paper.get('abstract', '')[:300]}...")
+        lines.append(f"链接: {paper.get('link', '')}")
         lines.append("")
 
     return "\n".join(lines)

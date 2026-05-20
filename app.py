@@ -1,10 +1,12 @@
 """
-ArXiv 论文检索 Agent - Gradio UI
+多源论文检索 Agent - FastAPI Service
 支持流式输出、实时检索状态展示、多格式导出
 """
 import json
-import gradio as gr
+import os
 from datetime import datetime
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 
 from core.agent import ArxivAgent, EventType, AgentEvent
 from core.memory import Memory
@@ -12,45 +14,66 @@ from core import exporter
 import config
 
 # ===================== 全局状态 =====================
-_agent: ArxivAgent = None
-_current_papers: list[dict] = []  # 当前轮次的论文
-_all_papers: list[dict] = []      # 所有相关论文
-
-
-def get_agent(api_key: str = None) -> ArxivAgent:
-    """获取或创建 Agent 实例"""
-    global _agent
-    if _agent is None:
-        _agent = ArxivAgent(api_key=api_key)
-    elif api_key:
-        _agent.api_key = api_key
-    return _agent
-
+# 本项目已实现会话状态隔离 (Session Isolation)
 
 # ===================== 核心交互逻辑 =====================
 
-def run_search(user_query: str, api_key: str, chat_history: list):
+def run_search(user_query: str, api_key: str, chat_history: list, agent: ArxivAgent,
+               base_url: str = None, model: str = None,
+               max_search_rounds: int = None, max_results_per_round: int = None,
+               providers: list[str] = None, provider_settings: dict[str, str] = None):
     """
-    运行 Agent 对话/检索流程（generator，支持流式输出和多轮对话）
-    Yields: (chat_history, status_text, papers_md, final_md)
+    运行 Agent 对话/检索流程（generator，支持流式输出和多轮对话，会话级隔离）
+    Yields: (chat_history, status_text, papers_md, final_md, agent)
     """
-    global _current_papers, _all_papers
-
     if not user_query.strip():
-        yield chat_history, "⚠️ 请输入检索需求", "", ""
+        yield chat_history, "⚠️ 请输入检索需求", "", "", agent
         return
 
+    chat_history = chat_history or []
     effective_key = api_key.strip() if api_key.strip() else config.DEEPSEEK_API_KEY
     if not effective_key:
-        yield chat_history, "⚠️ 请提供 DeepSeek API Key", "", ""
+        quick_intent = ArxivAgent.quick_intent(
+            user_query,
+            has_context=bool(agent and agent.has_context),
+            previous_query=agent.memory.user_query if agent else "",
+        )
+        if quick_intent and not quick_intent.get("needs_search", True):
+            chat_history = _append_user_message(chat_history, user_query)
+            response_text = quick_intent.get("response", "")
+            chat_history.append({"role": "assistant", "content": response_text})
+            if agent:
+                agent.memory.add_conversation("user", user_query)
+                agent.memory.add_conversation("assistant", response_text)
+            yield chat_history, "✅ 回复完成", "", "", agent
+            return
+        yield chat_history, "⚠️ 请提供 API Key", "", "", agent
         return
 
-    agent = get_agent(effective_key)
-    # 不再每次 reset — 保留多轮对话上下文
+    # 会话级实例化
+    if agent is None or not isinstance(agent, ArxivAgent):
+        agent = ArxivAgent(
+            api_key=effective_key,
+            base_url=base_url,
+            model=model,
+            max_search_rounds=max_search_rounds,
+            max_results_per_round=max_results_per_round,
+            providers=providers,
+            provider_settings=provider_settings,
+        )
+    else:
+        agent.update_config(
+            api_key=effective_key,
+            base_url=base_url,
+            model=model,
+            max_search_rounds=max_search_rounds,
+            max_results_per_round=max_results_per_round,
+            providers=providers,
+            provider_settings=provider_settings,
+        )
 
     # 添加用户消息到 UI 对话
-    chat_history = chat_history or []
-    chat_history.append({"role": "user", "content": user_query})
+    chat_history = _append_user_message(chat_history, user_query)
 
     # 用于累积 assistant 消息
     step_buffer = ""           # 当前步骤标题
@@ -76,7 +99,7 @@ def run_search(user_query: str, api_key: str, chat_history: list):
             if event.content:
                 chat_history.append({"role": "assistant",
                                      "content": event.content})
-            yield chat_history, status_text, papers_md, final_md
+            yield chat_history, status_text, papers_md, final_md, agent
 
         elif et == EventType.THINKING:
             thinking_buffer += event.content
@@ -90,7 +113,7 @@ def run_search(user_query: str, api_key: str, chat_history: list):
                 chat_history.append({"role": "assistant",
                                      "content": display,
                                      "_thinking": True})
-            yield chat_history, status_text, papers_md, final_md
+            yield chat_history, status_text, papers_md, final_md, agent
 
         elif et == EventType.SEARCH_START:
             if thinking_buffer:
@@ -98,15 +121,14 @@ def run_search(user_query: str, api_key: str, chat_history: list):
                 thinking_buffer = ""
             status_text = event.content
             chat_history.append({"role": "assistant", "content": event.content})
-            yield chat_history, status_text, papers_md, final_md
+            yield chat_history, status_text, papers_md, final_md, agent
 
         elif et == EventType.SEARCH_DONE:
             status_text = event.content
             papers = event.data.get("papers", []) if event.data else []
-            _current_papers = papers
             papers_md = _format_papers_table(papers, event.round_num)
             chat_history.append({"role": "assistant", "content": event.content})
-            yield chat_history, status_text, papers_md, final_md
+            yield chat_history, status_text, papers_md, final_md, agent
 
         elif et == EventType.REVIEW:
             if thinking_buffer:
@@ -127,10 +149,9 @@ def run_search(user_query: str, api_key: str, chat_history: list):
                 reason = review.get("refine_reason", "")
                 review_msg += f"\n\n🔄 建议优化: {reason}"
 
-            _all_papers.extend(relevant)
             chat_history.append({"role": "assistant", "content": review_msg})
             status_text = f"审核完成 | 质量: {quality}"
-            yield chat_history, status_text, papers_md, final_md
+            yield chat_history, status_text, papers_md, final_md, agent
 
         elif et == EventType.REFINE:
             if thinking_buffer:
@@ -146,7 +167,7 @@ def run_search(user_query: str, api_key: str, chat_history: list):
                 refine_msg += f"\n\n调整:\n{changes_str}"
 
             chat_history.append({"role": "assistant", "content": refine_msg})
-            yield chat_history, "策略已优化，准备下一轮检索...", papers_md, final_md
+            yield chat_history, "策略已优化，准备下一轮检索...", papers_md, final_md, agent
 
         elif et == EventType.REPORT:
             report_buffer += event.content
@@ -159,7 +180,7 @@ def run_search(user_query: str, api_key: str, chat_history: list):
                 chat_history.append({"role": "assistant",
                                      "content": f"📊 **最终报告**\n\n{report_buffer}",
                                      "_report": True})
-            yield chat_history, "正在生成报告...", papers_md, final_md
+            yield chat_history, "正在生成报告...", papers_md, final_md, agent
 
         elif et == EventType.CHAT_RESPONSE:
             # 多轮对话的流式回复
@@ -172,7 +193,7 @@ def run_search(user_query: str, api_key: str, chat_history: list):
                                      "content": chat_response_buffer,
                                      "_chat_reply": True})
             status_text = "💬 正在回复..."
-            yield chat_history, status_text, papers_md, final_md
+            yield chat_history, status_text, papers_md, final_md, agent
 
         elif et == EventType.DONE:
             if thinking_buffer:
@@ -180,19 +201,29 @@ def run_search(user_query: str, api_key: str, chat_history: list):
                 thinking_buffer = ""
             done_data = event.data or {}
             if done_data.get("type") == "chat":
-                # 多轮对话回复完成
                 status_text = "✅ 回复完成"
             else:
                 final_papers = done_data.get("final_papers", [])
-                _all_papers = final_papers
                 final_md = done_data.get("report", final_md)
                 status_text = f"✅ 检索完成！共推荐 {len(final_papers)} 篇论文。"
-            yield chat_history, status_text, papers_md, final_md
+            yield chat_history, status_text, papers_md, final_md, agent
 
         elif et == EventType.ERROR:
             chat_history.append({"role": "assistant", "content": event.content})
             status_text = "❌ 出错"
-            yield chat_history, status_text, papers_md, final_md
+            yield chat_history, status_text, papers_md, final_md, agent
+
+
+def _append_user_message(chat_history: list, user_query: str) -> list:
+    """追加当前用户消息，同时兼容旧前端已先追加的历史。"""
+    chat_history = list(chat_history or [])
+    if not (
+        chat_history
+        and chat_history[-1].get("role") == "user"
+        and str(chat_history[-1].get("content", "")).strip() == user_query.strip()
+    ):
+        chat_history.append({"role": "user", "content": user_query})
+    return chat_history
 
 
 def _flush_thinking(chat_history, step_name, thinking_text):
@@ -259,9 +290,14 @@ def _format_papers_table(papers: list[dict], round_num: int = 0) -> str:
         link = p.get("link", "")
         cats = ", ".join(p.get("categories", [])[:2])
         abstract = p.get("abstract", "")[:150]
+        source = p.get("source", "arxiv")
+        citation_count = p.get("citation_count", 0)
+        meta = f"📅 {date} | 👤 {authors} | 🏷️ {cats} | 🔎 {source}"
+        if citation_count:
+            meta += f" | 引用 {citation_count}"
 
         lines.append(f"**{i+1}. [{title}]({link})**")
-        lines.append(f"   📅 {date} | 👤 {authors} | 🏷️ {cats}")
+        lines.append(f"   {meta}")
         lines.append(f"   > {abstract}...")
         lines.append("")
 
@@ -311,10 +347,9 @@ def export_conversation(chat_history):
     return filepath, f"✅ 对话已导出: {filepath}"
 
 
-def export_results_md(api_key: str):
+def export_results_md(agent: ArxivAgent):
     """导出检索结果 Markdown"""
-    agent = get_agent(api_key)
-    if not agent.memory.search_rounds:
+    if not agent or not agent.memory.search_rounds:
         return None, "⚠️ 暂无检索结果可导出"
     content = exporter.export_search_results_md(agent.memory)
     filepath = exporter.save_export(
@@ -323,10 +358,9 @@ def export_results_md(api_key: str):
     return filepath, f"✅ 检索结果已导出: {filepath}"
 
 
-def export_results_csv(api_key: str):
+def export_results_csv(agent: ArxivAgent):
     """导出检索结果 CSV"""
-    agent = get_agent(api_key)
-    if not agent.memory.search_rounds:
+    if not agent or not agent.memory.search_rounds:
         return None, "⚠️ 暂无检索结果可导出"
     content = exporter.export_search_results_csv(agent.memory)
     filepath = exporter.save_export(
@@ -335,10 +369,9 @@ def export_results_csv(api_key: str):
     return filepath, f"✅ CSV 已导出: {filepath}"
 
 
-def export_results_json(api_key: str):
+def export_results_json(agent: ArxivAgent):
     """导出检索结果 JSON"""
-    agent = get_agent(api_key)
-    if not agent.memory.search_rounds:
+    if not agent or not agent.memory.search_rounds:
         return None, "⚠️ 暂无检索结果可导出"
     content = exporter.export_search_results_json(agent.memory)
     filepath = exporter.save_export(
@@ -347,9 +380,10 @@ def export_results_json(api_key: str):
     return filepath, f"✅ JSON 已导出: {filepath}"
 
 
-def export_report(api_key: str):
+def export_report(agent: ArxivAgent):
     """导出最终报告"""
-    agent = get_agent(api_key)
+    if not agent:
+        return None, "⚠️ 暂无报告可导出"
     content = exporter.export_final_report(agent.memory)
     if not content or content.strip() == "":
         return None, "⚠️ 暂无报告可导出"
@@ -359,269 +393,136 @@ def export_report(api_key: str):
     return filepath, f"✅ 报告已导出: {filepath}"
 
 
-def clear_all():
-    """清除所有状态"""
-    global _agent, _current_papers, _all_papers
-    if _agent:
-        _agent.reset()
-    _current_papers = []
-    _all_papers = []
-    return [], "已清除所有数据", "", ""
+# ===================== FastAPI Web App Setup =====================
 
+app = FastAPI(title=f"多源论文检索 Agent v{config.APP_VERSION}")
+agents_db = {}
 
-# ===================== 构建 Gradio UI =====================
+@app.get("/", response_class=HTMLResponse)
+def read_index():
+    index_path = os.path.join(os.path.dirname(__file__), "index.html")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h3>Error: index.html not found</h3>", status_code=404)
 
-def build_ui():
-    """构建 Gradio 界面"""
-
-    custom_css = """
-    /* ===== 全局主题 ===== */
-    .gradio-container {
-        max-width: 1400px !important;
-        margin: 0 auto !important;
-        font-family: 'Inter', 'Noto Sans SC', system-ui, -apple-system, sans-serif !important;
+@app.post("/api/search")
+async def api_search(request: Request):
+    data = await request.json()
+    user_query = data.get("query", "")
+    api_key = data.get("api_key", "")
+    base_url = data.get("base_url", "")
+    model = data.get("model", "")
+    
+    max_search_rounds = data.get("max_search_rounds")
+    if max_search_rounds is not None:
+        try:
+            max_search_rounds = int(max_search_rounds)
+        except ValueError:
+            max_search_rounds = None
+            
+    max_results_per_round = data.get("max_results_per_round")
+    if max_results_per_round is not None:
+        try:
+            max_results_per_round = int(max_results_per_round)
+        except ValueError:
+            max_results_per_round = None
+            
+    providers = data.get("providers")
+    provider_settings = {
+        "openalex_mailto": str(data.get("openalex_mailto", "") or "").strip(),
+        "crossref_mailto": str(data.get("crossref_mailto", "") or "").strip(),
+        "semantic_scholar_api_key": str(data.get("semantic_scholar_api_key", "") or "").strip(),
     }
+    
+    history = data.get("history", [])
+    session_id = data.get("session_id", "default")
+    
+    agent = agents_db.get(session_id)
+    
+    async def ndjson_generator():
+        nonlocal agent
+        try:
+            for chat_history, status_text, papers_md, final_md, updated_agent in run_search(
+                user_query, api_key, history, agent,
+                base_url=base_url, model=model,
+                max_search_rounds=max_search_rounds,
+                max_results_per_round=max_results_per_round,
+                providers=providers,
+                provider_settings=provider_settings,
+            ):
+                agent = updated_agent
+                agents_db[session_id] = agent
+                yield json.dumps({
+                    "chat_history": chat_history,
+                    "status_text": status_text,
+                    "papers_md": papers_md,
+                    "final_md": final_md
+                }, ensure_ascii=False) + "\n"
+        except Exception as e:
+            yield json.dumps({
+                "status_text": f"❌ 出错: {str(e)}"
+            }, ensure_ascii=False) + "\n"
+            
+    return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
 
-    /* ===== 顶部标题区 ===== */
-    .app-header {
-        background: linear-gradient(135deg, #0f0c29, #302b63, #24243e) !important;
-        border-radius: 16px !important;
-        padding: 24px 32px !important;
-        margin-bottom: 16px !important;
-        color: white !important;
-        text-align: center !important;
-        box-shadow: 0 8px 32px rgba(48, 43, 99, 0.4) !important;
-    }
-    .app-header h1 {
-        margin: 0 !important;
-        font-size: 1.8em !important;
-        font-weight: 700 !important;
-        background: linear-gradient(90deg, #67e8f9, #a78bfa, #f472b6) !important;
-        -webkit-background-clip: text !important;
-        -webkit-text-fill-color: transparent !important;
-    }
-    .app-header p {
-        margin: 6px 0 0 0 !important;
-        color: #a5b4fc !important;
-        font-size: 0.95em !important;
-    }
+@app.post("/api/export")
+async def api_export(request: Request):
+    data = await request.json()
+    export_type = data.get("type")
+    history = data.get("history", [])
+    session_id = data.get("session_id", "default")
+    
+    agent = agents_db.get(session_id)
+    
+    filepath = None
+    status = ""
+    
+    try:
+        if export_type == "chat":
+            filepath, status = export_conversation(history)
+        elif export_type == "md":
+            filepath, status = export_results_md(agent)
+        elif export_type == "csv":
+            filepath, status = export_results_csv(agent)
+        elif export_type == "json":
+            filepath, status = export_results_json(agent)
+        elif export_type == "report":
+            filepath, status = export_report(agent)
+        else:
+            return {"success": False, "status": "未知导出类型"}
+            
+        if filepath and os.path.exists(filepath):
+            return {
+                "success": True, 
+                "filename": os.path.basename(filepath), 
+                "status": status
+            }
+        return {"success": False, "status": status or "未生成导出 file"}
+    except Exception as e:
+        return {"success": False, "status": f"导出出错: {str(e)}"}
 
-    /* ===== 聊天区域 ===== */
-    .chat-panel {
-        border: 1px solid rgba(99, 102, 241, 0.2) !important;
-        border-radius: 12px !important;
-        background: rgba(15, 12, 41, 0.02) !important;
-    }
+@app.get("/api/download")
+def api_download(file: str):
+    filename = os.path.basename(file)
+    safe_path = os.path.join(os.path.dirname(__file__), "exports", filename)
+    if os.path.exists(safe_path):
+        return FileResponse(safe_path, filename=filename)
+    return HTMLResponse(content="<h3>文件不存在</h3>", status_code=404)
 
-    /* ===== 状态栏 ===== */
-    .status-bar textarea {
-        background: linear-gradient(90deg, #1e1b4b, #312e81) !important;
-        color: #c7d2fe !important;
-        border: none !important;
-        border-radius: 8px !important;
-        font-weight: 500 !important;
-        padding: 10px 16px !important;
-        font-size: 0.9em !important;
-    }
-
-    /* ===== 结果面板 ===== */
-    .results-panel {
-        border: 1px solid rgba(99, 102, 241, 0.15) !important;
-        border-radius: 12px !important;
-        min-height: 300px !important;
-    }
-
-    /* ===== 按钮样式 ===== */
-    .export-btn {
-        border-radius: 8px !important;
-        font-weight: 500 !important;
-        transition: all 0.3s ease !important;
-    }
-    .primary-btn {
-        background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
-        border: none !important;
-        color: white !important;
-        font-weight: 600 !important;
-        border-radius: 10px !important;
-        box-shadow: 0 4px 15px rgba(99, 102, 241, 0.35) !important;
-    }
-    .primary-btn:hover {
-        box-shadow: 0 6px 20px rgba(99, 102, 241, 0.5) !important;
-        transform: translateY(-1px) !important;
-    }
-    .danger-btn {
-        background: linear-gradient(135deg, #ef4444, #dc2626) !important;
-        border: none !important;
-        color: white !important;
-    }
-
-    /* ===== Tab 标签 ===== */
-    .tab-nav button {
-        font-weight: 500 !important;
-        border-radius: 8px 8px 0 0 !important;
-    }
-    .tab-nav button.selected {
-        background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
-        color: white !important;
-    }
-    """
-
-    with gr.Blocks(
-        title="ArXiv 论文检索 Agent",
-        css=custom_css,
-        theme=gr.themes.Soft(
-            primary_hue="indigo",
-            secondary_hue="violet",
-            neutral_hue="slate",
-            font=[
-                gr.themes.GoogleFont("Inter"),
-                gr.themes.GoogleFont("Noto Sans SC"),
-                "system-ui",
-                "sans-serif",
-            ],
-        ),
-    ) as demo:
-
-        # ---------- 顶部标题 ----------
-        gr.HTML("""
-        <div class="app-header">
-            <h1>🔍 ArXiv 论文检索 Agent</h1>
-            <p>由 DeepSeek 大模型驱动 · 自然语言检索 · 智能迭代优化 · 实时流式展示</p>
-        </div>
-        """)
-
-        # ---------- API Key ----------
-        with gr.Row():
-            api_key_input = gr.Textbox(
-                label="🔑 DeepSeek API Key",
-                placeholder="留空则使用默认配置",
-                type="password",
-                scale=3,
-            )
-            status_bar = gr.Textbox(
-                label="📡 Agent 状态",
-                value="就绪，等待输入...",
-                interactive=False,
-                scale=2,
-                elem_classes=["status-bar"],
-            )
-
-        # ---------- 主体区域：左对话 + 右结果 ----------
-        with gr.Row(equal_height=True):
-            # ---- 左侧：对话 ----
-            with gr.Column(scale=3):
-                chatbot = gr.Chatbot(
-                    label="💬 对话",
-                    height=520,
-                    buttons=["copy", "copy_all"],
-                    elem_classes=["chat-panel"],
-                    avatar_images=(None, None),
-                )
-                with gr.Row():
-                    user_input = gr.Textbox(
-                        label="输入检索需求或追问",
-                        placeholder="例如：最近关于大语言模型推理能力的论文 / 只看2024年以后的 / 第3篇讲了什么",
-                        scale=5,
-                        lines=1,
-                    )
-                    send_btn = gr.Button(
-                        "🚀 发送",
-                        variant="primary",
-                        scale=1,
-                        elem_classes=["primary-btn"],
-                    )
-
-            # ---- 右侧：结果 Tabs ----
-            with gr.Column(scale=2):
-                with gr.Tabs():
-                    with gr.Tab("📑 检索结果"):
-                        papers_display = gr.Markdown(
-                            value="*等待检索...*",
-                            elem_classes=["results-panel"],
-                        )
-                    with gr.Tab("📊 最终报告"):
-                        report_display = gr.Markdown(
-                            value="*检索完成后将在此展示最终报告*",
-                            elem_classes=["results-panel"],
-                        )
-
-        # ---------- 底部：导出 & 清除 ----------
-        with gr.Row():
-            export_conv_btn = gr.Button("💾 导出对话", elem_classes=["export-btn"])
-            export_md_btn = gr.Button("📄 导出结果(MD)", elem_classes=["export-btn"])
-            export_csv_btn = gr.Button("📊 导出结果(CSV)", elem_classes=["export-btn"])
-            export_json_btn = gr.Button("🗂️ 导出结果(JSON)", elem_classes=["export-btn"])
-            export_report_btn = gr.Button("📋 导出报告", elem_classes=["export-btn"])
-            clear_btn = gr.Button("🗑️ 清除全部", elem_classes=["danger-btn"])
-
-        with gr.Row():
-            export_file = gr.File(label="📥 下载导出文件", visible=True)
-            export_status = gr.Textbox(label="导出状态", interactive=False)
-
-        # ==================== 事件绑定 ====================
-
-        # 发送检索
-        send_btn.click(
-            fn=run_search,
-            inputs=[user_input, api_key_input, chatbot],
-            outputs=[chatbot, status_bar, papers_display, report_display],
-        ).then(
-            fn=lambda: "",
-            outputs=[user_input],
-        )
-
-        # Enter 键发送
-        user_input.submit(
-            fn=run_search,
-            inputs=[user_input, api_key_input, chatbot],
-            outputs=[chatbot, status_bar, papers_display, report_display],
-        ).then(
-            fn=lambda: "",
-            outputs=[user_input],
-        )
-
-        # 导出按钮
-        export_conv_btn.click(
-            fn=export_conversation,
-            inputs=[chatbot],
-            outputs=[export_file, export_status],
-        )
-        export_md_btn.click(
-            fn=export_results_md,
-            inputs=[api_key_input],
-            outputs=[export_file, export_status],
-        )
-        export_csv_btn.click(
-            fn=export_results_csv,
-            inputs=[api_key_input],
-            outputs=[export_file, export_status],
-        )
-        export_json_btn.click(
-            fn=export_results_json,
-            inputs=[api_key_input],
-            outputs=[export_file, export_status],
-        )
-        export_report_btn.click(
-            fn=export_report,
-            inputs=[api_key_input],
-            outputs=[export_file, export_status],
-        )
-
-        # 清除
-        clear_btn.click(
-            fn=clear_all,
-            outputs=[chatbot, status_bar, papers_display, report_display],
-        )
-
-    return demo
+@app.post("/api/clear")
+async def api_clear(request: Request):
+    data = await request.json()
+    session_id = data.get("session_id", "default")
+    agent = agents_db.get(session_id)
+    if agent:
+        agent.reset()
+        if session_id in agents_db:
+            del agents_db[session_id]
+    return {"success": True, "status": "状态已清除"}
 
 
 # ===================== 入口 =====================
 if __name__ == "__main__":
-    demo = build_ui()
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        show_error=True,
-    )
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)

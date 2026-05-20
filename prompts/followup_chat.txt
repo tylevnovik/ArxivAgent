@@ -22,10 +22,10 @@
 5. **一般对话**：用户的闲聊或不涉及检索操作的问题
 
 请以严格的 JSON 格式输出，不要包含任何其他文本或 markdown 标记：
-{{
+{
   "intent": "new_search / append_search / refine_search / discuss_results / general_chat",
   "analysis": "对用户意图的分析（中文）",
   "needs_search": true或false,
   "search_query": "如果需要检索，整合后的完整检索需求描述（中文）。如果是追加/细化，应融合之前的上下文",
   "response": "如果不需要检索（discuss_results或general_chat），直接在此给出完整的回复内容（中文）"
-}}
+}

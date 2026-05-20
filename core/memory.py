@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 class SearchRound:
     """一轮检索的记录"""
     round_number: int
-    query: str              # arXiv 检索式
+    query: str              # 主检索式（arXiv 语法，同时作为多源检索的结构化线索）
     strategy: str           # 检索策略说明
     results: list[dict]     # 原始检索结果
     review: dict            # LLM 审核结果

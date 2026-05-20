@@ -15,7 +15,7 @@ from core.memory import Memory
 def export_conversation_md(memory: Memory) -> str:
     """导出对话历史为 Markdown 格式"""
     lines = [
-        f"# ArXiv 论文检索对话记录",
+        f"# 多源论文检索对话记录",
         f"",
         f"**用户需求**: {memory.user_query}",
         f"**导出时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -40,7 +40,7 @@ def export_conversation_md(memory: Memory) -> str:
 def export_search_results_md(memory: Memory) -> str:
     """导出检索结果为 Markdown 格式"""
     lines = [
-        f"# ArXiv 检索结果报告",
+        f"# 多源论文检索结果报告",
         f"",
         f"**用户需求**: {memory.user_query}",
         f"**检索轮次**: {len(memory.search_rounds)}",
@@ -62,9 +62,14 @@ def export_search_results_md(memory: Memory) -> str:
             lines.append("")
             for i, paper in enumerate(sr.relevant_papers):
                 lines.append(f"#### {i + 1}. {paper['title']}")
+                lines.append(f"- **来源**: {paper.get('source', 'arxiv')}")
                 lines.append(f"- **作者**: {', '.join(paper.get('authors', [])[:5])}")
                 lines.append(f"- **类别**: {', '.join(paper.get('categories', []))}")
                 lines.append(f"- **发表日期**: {paper.get('published', '')[:10]}")
+                if paper.get("doi"):
+                    lines.append(f"- **DOI**: {paper['doi']}")
+                if paper.get("citation_count"):
+                    lines.append(f"- **引用数**: {paper['citation_count']}")
                 lines.append(f"- **链接**: [{paper.get('link', '')}]({paper.get('link', '')})")
                 if paper.get('abstract'):
                     lines.append(f"- **摘要**: {paper['abstract'][:200]}...")
@@ -82,17 +87,20 @@ def export_search_results_csv(memory: Memory) -> str:
     writer = csv.writer(output)
     
     writer.writerow([
-        "轮次", "标题", "作者", "类别", "发表日期", "摘要", "链接", "PDF链接"
+        "轮次", "来源", "标题", "作者", "类别", "发表日期", "DOI", "引用数", "摘要", "链接", "PDF链接"
     ])
     
     for sr in memory.search_rounds:
         for paper in sr.relevant_papers:
             writer.writerow([
                 sr.round_number,
+                paper.get("source", "arxiv"),
                 paper.get("title", ""),
                 "; ".join(paper.get("authors", [])),
                 "; ".join(paper.get("categories", [])),
                 paper.get("published", "")[:10],
+                paper.get("doi", ""),
+                paper.get("citation_count", ""),
                 paper.get("abstract", "")[:200],
                 paper.get("link", ""),
                 paper.get("pdf_link", ""),
@@ -129,7 +137,7 @@ def export_final_report(memory: Memory) -> str:
     
     # 如果没有预生成的报告，构建简单报告
     lines = [
-        f"# ArXiv 论文检索最终报告",
+        f"# 多源论文检索最终报告",
         f"",
         f"**用户需求**: {memory.user_query}",
         f"**检索轮次**: {len(memory.search_rounds)}",
@@ -142,9 +150,14 @@ def export_final_report(memory: Memory) -> str:
     
     for i, paper in enumerate(memory.final_papers):
         lines.append(f"### {i + 1}. {paper['title']}")
+        lines.append(f"- **来源**: {paper.get('source', 'arxiv')}")
         lines.append(f"- **作者**: {', '.join(paper.get('authors', [])[:5])}")
         lines.append(f"- **类别**: {', '.join(paper.get('categories', []))}")
         lines.append(f"- **发表日期**: {paper.get('published', '')[:10]}")
+        if paper.get("doi"):
+            lines.append(f"- **DOI**: {paper['doi']}")
+        if paper.get("citation_count"):
+            lines.append(f"- **引用数**: {paper['citation_count']}")
         lines.append(f"- **链接**: [{paper.get('link', '')}]({paper.get('link', '')})")
         if paper.get("abstract"):
             lines.append(f"- **摘要**: {paper['abstract'][:300]}")

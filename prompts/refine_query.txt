@@ -20,11 +20,11 @@
 5. 可以尝试不同的关键词组合或同义词
 
 请以严格的 JSON 格式输出，不要包含任何其他文本或 markdown 标记：
-{{
+{
   "optimization_analysis": "优化分析说明（中文）",
   "changes_made": ["具体调整1", "具体调整2"],
   "arxiv_query": "优化后的新检索式",
   "sort_by": "relevance 或 lastUpdatedDate 或 submittedDate",
   "max_results": 10,
   "expected_improvement": "预期改进效果说明（中文）"
-}}
+}

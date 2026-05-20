@@ -1,15 +1,20 @@
-# 🔍 ArXiv 论文检索 Agent
+# 🔍 多源论文检索 Agent
 
-基于 DeepSeek 大模型 API 驱动的智能 arXiv 论文检索代理。
+基于 DeepSeek 大模型 API 驱动的智能论文检索代理，支持 arXiv、OpenAlex、Crossref 等开放学术数据源。
+
+当前版本：`v0.1.0`
 
 ## 功能特性
 
 - 🗣️ **自然语言检索**：用中文描述检索需求，Agent 自动理解并构造检索式
 - 🔄 **智能迭代优化**：自动审核检索结果，不满意时迭代优化检索策略
+- 🌐 **多源检索**：支持 arXiv、OpenAlex、Crossref、Semantic Scholar，并带本地缓存、去重与轻量排序
 - 📡 **实时流式展示**：Agent 思考过程、检索状态实时流式展示
 - 🧠 **检索记忆**：记住历史检索轮次，避免重复无效检索
+- 💬 **意图识别**：区分闲聊、检索、修正和结果追问，避免无意义检索
+- 📚 **正文 RAG**：在最终报告和后续追问中结合可解析的论文 PDF 正文片段
 - 📤 **多格式导出**：支持 Markdown、CSV、JSON 格式导出对话和结果
-- 🎨 **精美 UI**：基于 Gradio 的现代化交互界面
+- 🎨 **Web UI**：基于 FastAPI + 单页前端的现代化交互界面
 
 ## 项目结构
 
@@ -27,7 +32,8 @@ ArxivAgent/
 │   ├── memory.py        # 对话 & 检索记忆
 │   ├── agent.py         # Agent 主循环
 │   └── exporter.py      # 导出功能
-├── app.py               # Gradio UI 入口
+├── index.html           # 单页前端
+├── app.py               # FastAPI 服务入口
 ├── config.py            # 配置管理
 └── requirements.txt     # 依赖
 ```
@@ -35,7 +41,7 @@ ArxivAgent/
 ## Agent 工作流程
 
 ```
-用户输入 → [理解需求] → 构造检索式 → [arXiv 检索] → [审核结果]
+用户输入 → [理解需求] → 构造检索式 → [多源检索] → [审核结果]
                                                        ↓
                                            满意？→ 否 → [优化策略] → 重新检索
                                                        ↓
@@ -63,5 +69,23 @@ python app.py
 
 编辑 `config.py` 可修改：
 - DeepSeek API Key 和模型配置
-- arXiv 检索参数
+- arXiv / OpenAlex / Crossref 检索参数
 - 最大检索轮次
+
+也可以通过 `.env` 调整：
+
+```bash
+DEEPSEEK_API_KEY=你的key
+SEARCH_PROVIDERS=arxiv,openalex,crossref
+SEARCH_PROVIDER_TIMEOUT_SECONDS=15
+SEARCH_CACHE_TTL_SECONDS=86400
+OPENALEX_MAILTO=your-email@example.com
+CROSSREF_MAILTO=your-email@example.com
+SEMANTIC_SCHOLAR_API_KEY=可选
+```
+
+如需启用 Semantic Scholar，可把 `SEARCH_PROVIDERS` 改为：
+
+```bash
+SEARCH_PROVIDERS=arxiv,openalex,semantic_scholar,crossref
+```

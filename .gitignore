@@ -1,0 +1,7 @@
+.env
+.cache/
+__pycache__/
+*.py[cod]
+exports/
+pdf_cache/
+app_backup.py

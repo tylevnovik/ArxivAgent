@@ -1,3 +1,6 @@
 openai>=1.0.0
-gradio>=4.0.0
 requests
+python-dotenv
+pypdf
+fastapi
+uvicorn
