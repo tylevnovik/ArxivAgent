@@ -400,11 +400,12 @@ class ArxivAgent:
                         all_chunks.extend(chunks)
                 
                 if all_chunks:
-                    from core.rag import TFIDFRetriever
-                    self.retriever = TFIDFRetriever()
-                    self.retriever.build_index(all_chunks)
+                    self.retriever, retriever_summary = self._build_rag_retriever(all_chunks)
                     yield AgentEvent(EventType.STEP_START, step_name="解析正文",
-                                     content=f"📝 正文解析完成，共构建 {len(all_chunks)} 个文本分块的本地 RAG 索引。")
+                                     content=(
+                                         f"📝 正文解析完成，共构建 {len(all_chunks)} 个文本分块的本地 RAG 索引。\n"
+                                         f"检索器: {retriever_summary}"
+                                     ))
                 else:
                     self.retriever = None
                     yield AgentEvent(EventType.STEP_START, step_name="解析正文",
@@ -527,6 +528,25 @@ class ArxivAgent:
 
     # ======================== 各步骤实现 ========================
 
+    def _build_rag_retriever(self, chunks: list[dict]):
+        """优先构建混合检索器，依赖不可用时回退到轻量 TF-IDF。"""
+        from core.rag import TFIDFRetriever
+
+        retriever_type = getattr(config, "RAG_RETRIEVER_TYPE", "hybrid")
+        if retriever_type == "hybrid":
+            try:
+                from core.rag import HybridRetriever
+
+                retriever = HybridRetriever()
+                retriever.build_index(chunks)
+                return retriever, retriever.index_summary
+            except Exception as e:
+                print(f"⚠️ Hybrid RAG 初始化失败，降级为 TF-IDF: {e}")
+
+        retriever = TFIDFRetriever()
+        retriever.build_index(chunks)
+        return retriever, f"TFIDFRetriever(fallback, chunks={len(chunks)})"
+
     def _step_parse_query(self, user_query: str, round_num: int):
         """理解需求 + 构造检索式"""
         prompt_content = llm.load_prompt(
@@ -604,12 +624,9 @@ class ArxivAgent:
         # 检索正文切片 (RAG)
         rag_context = ""
         if hasattr(self, "retriever") and self.retriever and self.retriever.chunks:
-            retrieved = self.retriever.retrieve(user_query, top_k=6)
+            retrieved = self.retriever.retrieve(user_query, top_k=config.RAG_TOP_K)
             if retrieved:
-                rag_context = "\n\n".join(
-                    f"【文献: {r['paper_title']} | 分块 {r['chunk_index']}】\n{r['text']}"
-                    for r in retrieved
-                )
+                rag_context = _format_rag_context(retrieved)
         if not rag_context:
             rag_context = "（未提供正文切片，请仅使用已有摘要信息生成报告）"
 
@@ -688,12 +705,9 @@ class ArxivAgent:
         # 检索正文切片 (RAG)
         rag_context = ""
         if hasattr(self, "retriever") and self.retriever and self.retriever.chunks:
-            retrieved = self.retriever.retrieve(user_message, top_k=6)
+            retrieved = self.retriever.retrieve(user_message, top_k=config.RAG_TOP_K)
             if retrieved:
-                rag_context = "\n\n".join(
-                    f"【文献: {r['paper_title']} | 分块 {r['chunk_index']}】\n{r['text']}"
-                    for r in retrieved
-                )
+                rag_context = _format_rag_context(retrieved)
 
         rag_section = ""
         if rag_context:
@@ -736,3 +750,30 @@ class ArxivAgent:
             lines.append(f"[{role}]: {content}")
 
         return "\n".join(lines)
+
+
+def _format_rag_context(retrieved: list[dict]) -> str:
+    """把 RAG 命中的分块格式化成报告可直接引用的正文证据。"""
+    blocks = []
+    for r in retrieved:
+        title = r.get("paper_title", "未知论文")
+        chunk_index = r.get("chunk_index", "N/A")
+        sources = ",".join(r.get("retrieval_sources", [])) or "unknown"
+        score_bits = []
+        if "hybrid_score" in r:
+            score_bits.append(f"hybrid={r['hybrid_score']:.4f}")
+        if "dense_score" in r:
+            score_bits.append(f"dense={r['dense_score']:.4f}")
+        if "bm25_score" in r:
+            score_bits.append(f"bm25={r['bm25_score']:.4f}")
+        if "rerank_score" in r:
+            score_bits.append(f"rerank={r['rerank_score']:.4f}")
+
+        meta = f"来源={sources}"
+        if score_bits:
+            meta += " | " + " | ".join(score_bits)
+        blocks.append(
+            f"【正文: {title} | 分块 {chunk_index} | {meta}】\n"
+            f"{r.get('text', '')}"
+        )
+    return "\n\n".join(blocks)

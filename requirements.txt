@@ -4,3 +4,5 @@ python-dotenv
 pypdf
 fastapi
 uvicorn
+qdrant-client[fastembed]>=1.14.1
+bm25s>=0.2.14

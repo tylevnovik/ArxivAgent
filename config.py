@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 应用版本
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.2.0"
 
 # DeepSeek API 配置
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -50,3 +50,26 @@ os.makedirs(SEARCH_CACHE_DIR, exist_ok=True)
 # PDF 缓存目录
 PDF_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
 os.makedirs(PDF_CACHE_DIR, exist_ok=True)
+
+# RAG 检索配置
+# 默认使用本地 FastEmbed + Qdrant local mode + BM25S 混合检索；依赖不可用时自动降级为 TF-IDF。
+RAG_RETRIEVER_TYPE = os.environ.get("RAG_RETRIEVER_TYPE", "hybrid").strip().lower()
+RAG_EMBEDDING_MODEL = os.environ.get(
+    "RAG_EMBEDDING_MODEL",
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+)
+RAG_QDRANT_LOCATION = os.environ.get(
+    "RAG_QDRANT_LOCATION",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "qdrant"),
+)
+RAG_QDRANT_COLLECTION_PREFIX = os.environ.get("RAG_QDRANT_COLLECTION_PREFIX", "arxiv_agent_rag")
+RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "6"))
+RAG_DENSE_CANDIDATES = int(os.environ.get("RAG_DENSE_CANDIDATES", "20"))
+RAG_BM25_CANDIDATES = int(os.environ.get("RAG_BM25_CANDIDATES", "20"))
+RAG_RRF_K = int(os.environ.get("RAG_RRF_K", "60"))
+RAG_DENSE_WEIGHT = float(os.environ.get("RAG_DENSE_WEIGHT", "1.0"))
+RAG_BM25_WEIGHT = float(os.environ.get("RAG_BM25_WEIGHT", "1.0"))
+RAG_ENABLE_RERANKER = os.environ.get("RAG_ENABLE_RERANKER", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+RAG_RERANKER_MODEL = os.environ.get("RAG_RERANKER_MODEL", "BAAI/bge-reranker-base")

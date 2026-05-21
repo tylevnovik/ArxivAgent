@@ -2,7 +2,7 @@
 
 基于 DeepSeek 大模型 API 驱动的智能论文检索代理，支持 arXiv、OpenAlex、Crossref 等开放学术数据源。
 
-当前版本：`v0.1.1`
+当前版本：`v0.2.0`
 
 ## 功能特性
 
@@ -12,7 +12,7 @@
 - 📡 **实时流式展示**：Agent 思考过程、检索状态实时流式展示
 - 🧠 **检索记忆**：记住历史检索轮次，避免重复无效检索
 - 💬 **意图识别**：区分闲聊、检索、修正和结果追问，避免无意义检索
-- 📚 **正文 RAG**：在最终报告和后续追问中结合可解析的论文 PDF 正文片段
+- 📚 **混合正文 RAG**：使用本地 FastEmbed 向量化、Qdrant 向量库、BM25S 关键词索引和 RRF 融合，在最终报告和后续追问中引用论文正文片段
 - 📤 **多格式导出**：支持 Markdown、CSV、JSON 格式导出对话和结果
 - 🎨 **Web UI**：基于 FastAPI + 单页前端的现代化交互界面
 
@@ -89,3 +89,31 @@ SEMANTIC_SCHOLAR_API_KEY=可选
 ```bash
 SEARCH_PROVIDERS=arxiv,openalex,semantic_scholar,crossref
 ```
+
+### RAG 配置
+
+默认 RAG 使用本地方案，不需要 OpenAI API Key，也不要求 Docker：
+
+- `FastEmbed` 负责本地 embedding，默认模型为 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+- `Qdrant local mode` 负责 dense vector 检索，默认数据目录为 `.cache/qdrant`
+- `BM25S` 负责关键词召回
+- `RRF` 负责融合向量召回和 BM25 召回
+- 可选 reranker 默认关闭，避免首次下载和推理成本过高
+
+可通过 `.env` 调整：
+
+```bash
+RAG_RETRIEVER_TYPE=hybrid
+RAG_EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+RAG_QDRANT_LOCATION=.cache/qdrant
+RAG_TOP_K=6
+RAG_DENSE_CANDIDATES=20
+RAG_BM25_CANDIDATES=20
+RAG_RRF_K=60
+RAG_ENABLE_RERANKER=false
+RAG_RERANKER_MODEL=BAAI/bge-reranker-base
+```
+
+如果本地机器暂时无法安装或下载 Qdrant/FastEmbed/BM25S 依赖，Agent 会自动降级为轻量 TF-IDF RAG，不会中断主流程。首次运行本地 embedding 模型时需要下载模型文件，之后会走本机缓存。
+
+注意：Qdrant local mode 适合单进程桌面/本地运行；如果多个 Python 进程同时访问同一个 `.cache/qdrant` 目录，Qdrant 会加锁。此时 Agent 会自动退到 Qdrant `:memory:` 继续使用 hybrid 检索。需要多进程或多人并发部署时，建议改用独立 Qdrant server，并把 `RAG_QDRANT_LOCATION` 配成服务 URL。
