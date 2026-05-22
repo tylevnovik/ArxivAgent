@@ -25,16 +25,22 @@ ArxivAgent/
 │   ├── query_parse.txt  # 需求理解 & 构造检索式
 │   ├── result_review.txt# 审核检索结果
 │   ├── refine_query.txt # 优化检索策略
+│   ├── error_recovery.txt # 检索出错时的恢复策略
+│   ├── followup_chat.txt # 对话追问提示词
 │   └── summary.txt      # 生成最终报告
 ├── core/                # 核心模块
 │   ├── llm.py           # DeepSeek API 封装
 │   ├── arxiv_search.py  # arXiv API 封装
+│   ├── search_service.py# 多源论文检索、缓存与排序服务
+│   ├── pdf_parser.py    # PDF 下载与文本提取分块
+│   ├── rag.py           # 本地混合 RAG 检索器 (Qdrant + BM25S + RRF)
 │   ├── memory.py        # 对话 & 检索记忆
 │   ├── agent.py         # Agent 主循环
 │   └── exporter.py      # 导出功能
 ├── index.html           # 单页前端
 ├── app.py               # FastAPI 服务入口
 ├── config.py            # 配置管理
+├── VERSION              # 版本号文件
 └── requirements.txt     # 依赖
 ```
 
