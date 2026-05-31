@@ -5,3 +5,4 @@ __pycache__/
 exports/
 pdf_cache/
 app_backup.py
+.idea/
