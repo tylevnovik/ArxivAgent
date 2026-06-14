@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 应用版本
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.4.0"
 
 # DeepSeek API 配置
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")

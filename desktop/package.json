@@ -1,6 +1,6 @@
 {
 	"name": "arxiv-agent-desktop",
-	"version": "0.2.0",
+	"version": "0.4.0",
 	"description": "ArxivAgent desktop shell built with Electron, React, Tailwind CSS, and Vite",
 	"main": "src/electron/main.cjs",
 	"scripts": {
@@ -72,16 +72,12 @@
 				"to": "backend/config.py"
 			},
 			{
-				"from": "../index.html",
-				"to": "backend/index.html"
+				"from": "../pyproject.toml",
+				"to": "backend/pyproject.toml"
 			},
 			{
-				"from": "../requirements.txt",
-				"to": "backend/requirements.txt"
-			},
-			{
-				"from": "../VERSION",
-				"to": "backend/VERSION"
+				"from": "../.python-version",
+				"to": "backend/.python-version"
 			},
 			{
 				"from": "../core",

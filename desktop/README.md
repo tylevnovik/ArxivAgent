@@ -27,6 +27,6 @@ bun run build:canary
 ```
 
 The Electron build copies the Vite view assets into the app package and the
-Python backend files into Electron `resources/backend`. A packaged app still
-needs a working Python runtime with the root `requirements.txt` dependencies
-available on the target machine.
+Python backend files into Electron `resources/backend`. A packaged app bundles
+a Python runtime + site-packages; if dependencies are missing, the SetupWizard
+will present `uv sync` commands using the bundled `pyproject.toml`.

@@ -1,6 +1,6 @@
 [project]
 name = "arxiv-agent"
-version = "0.3.0"
+version = "0.4.0"
 description = "多源论文检索 Agent — 自然语言驱动的研究工作台"
 readme = "README.md"
 requires-python = ">=3.10"
