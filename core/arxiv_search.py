@@ -389,6 +389,7 @@ def format_papers_for_llm(papers: list[dict]) -> str:
     lines = []
     for i, paper in enumerate(papers):
         lines.append(f"--- 论文 {i + 1} ---")
+        lines.append(f"索引: {i}")
         authors = paper.get("authors", [])
         categories = paper.get("categories", [])
         lines.append(f"标题: {paper.get('title', '无标题')}")

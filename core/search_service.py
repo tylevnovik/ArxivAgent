@@ -401,6 +401,7 @@ class SearchService:
         natural_query: str,
         max_results: int,
         sort_by: str = "relevance",
+        cancel_event=None,
     ) -> SearchResult:
         cache_key = self._cache_key(arxiv_query, natural_query, max_results, sort_by)
         cached = self._read_cache(cache_key)
@@ -412,6 +413,10 @@ class SearchService:
         provider_limit = max(max_results * 3, 10)
 
         for provider in self.providers:
+            # provider 之间检查取消：避免取消后又去打下一个源
+            if cancel_event is not None and cancel_event.is_set():
+                from core.llm import CancelledError
+                raise CancelledError("cancelled between providers")
             outcome = provider.search(
                 arxiv_query=arxiv_query,
                 natural_query=natural_query,

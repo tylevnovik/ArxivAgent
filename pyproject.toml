@@ -1,0 +1,33 @@
+[project]
+name = "arxiv-agent"
+version = "0.3.0"
+description = "多源论文检索 Agent — 自然语言驱动的研究工作台"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0.0",
+    "requests",
+    "python-dotenv",
+    "pypdf",
+    "fastapi",
+    "uvicorn",
+    "qdrant-client[fastembed]>=1.14.1",
+    "bm25s>=0.2.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio",
+    "httpx",
+]
+
+# uv 配置：建议用 uv 管理环境与依赖
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests/backend"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]

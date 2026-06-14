@@ -39,17 +39,27 @@ MAX_ERROR_RECOVERY = 2        # 检索错误恢复最大尝试次数
 # 提示词模板目录
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
 
+# 运行期数据目录
+DATA_DIR = os.path.abspath(
+    os.environ.get("ARXIV_AGENT_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+)
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # 导出目录
-EXPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exports")
+EXPORT_DIR = os.path.join(DATA_DIR, "exports")
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
 # 检索缓存目录
-SEARCH_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "search")
+SEARCH_CACHE_DIR = os.path.join(DATA_DIR, ".cache", "search")
 os.makedirs(SEARCH_CACHE_DIR, exist_ok=True)
 
 # PDF 缓存目录
-PDF_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+PDF_CACHE_DIR = os.path.join(DATA_DIR, "pdf_cache")
 os.makedirs(PDF_CACHE_DIR, exist_ok=True)
+
+# 线程持久化目录（每个线程一个 JSON）
+THREADS_DIR = os.path.join(DATA_DIR, "threads")
+os.makedirs(THREADS_DIR, exist_ok=True)
 
 # RAG 检索配置
 # 默认使用本地 FastEmbed + Qdrant local mode + BM25S 混合检索；依赖不可用时自动降级为 TF-IDF。
@@ -60,7 +70,7 @@ RAG_EMBEDDING_MODEL = os.environ.get(
 )
 RAG_QDRANT_LOCATION = os.environ.get(
     "RAG_QDRANT_LOCATION",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "qdrant"),
+    os.path.join(DATA_DIR, ".cache", "qdrant"),
 )
 RAG_QDRANT_COLLECTION_PREFIX = os.environ.get("RAG_QDRANT_COLLECTION_PREFIX", "arxiv_agent_rag")
 RAG_TOP_K = int(os.environ.get("RAG_TOP_K", "6"))

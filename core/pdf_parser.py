@@ -105,5 +105,5 @@ def process_paper_pdf(title: str, pdf_link: str) -> list[dict]:
             })
         return chunks
     except Exception as e:
-        print(f"⚠️ 处理论文 PDF 失败: {title} ({pdf_link}) - 错误: {e}")
+        print(f"[WARN] Failed to process paper PDF: {title} ({pdf_link}) - {e}")
         return []

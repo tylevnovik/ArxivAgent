@@ -5,14 +5,17 @@ Agent 主循环逻辑
 """
 import json
 import re
+import sys
 import traceback
 from dataclasses import dataclass, field
+from datetime import date
 from enum import Enum
 from typing import Generator, Optional
 
 import config
 from core import llm, arxiv_search
 from core.arxiv_search import SearchResult, SearchErrorType
+from core.llm import CancelledError
 from core.memory import Memory
 from core.search_service import SearchService
 
@@ -41,20 +44,122 @@ class AgentEvent:
     step_name: str = ""         # 步骤名称
 
 
+def _safe_log(text: str) -> None:
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    safe = str(text).encode(encoding, errors="replace").decode(encoding, errors="replace")
+    print(safe)
+
+
+def _coerce_int(value, default: int, min_value: int | None = None,
+                max_value: int | None = None) -> int:
+    try:
+        if isinstance(value, str):
+            value = value.strip()
+        num = int(float(value))
+    except (TypeError, ValueError):
+        num = default
+    if min_value is not None:
+        num = max(min_value, num)
+    if max_value is not None:
+        num = min(max_value, num)
+    return num
+
+
+def _coerce_float(value, default: float, min_value: float | None = None,
+                  max_value: float | None = None) -> float:
+    try:
+        if isinstance(value, str):
+            normalized = value.strip()
+            is_percent = normalized.endswith("%")
+            num = float(normalized.rstrip("%"))
+            if num > 1 and is_percent:
+                num = num / 100
+        else:
+            num = float(value)
+    except (TypeError, ValueError):
+        num = default
+    if min_value is not None:
+        num = max(min_value, num)
+    if max_value is not None:
+        num = min(max_value, num)
+    return num
+
+
+def _coerce_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "是", "需要"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "否", "不需要"}:
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _normalize_title(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _select_relevant_papers(reviewed_papers, papers: list[dict]) -> list[dict]:
+    if reviewed_papers is None:
+        return papers
+    if not isinstance(reviewed_papers, list):
+        return []
+
+    selected: list[dict] = []
+    seen: set[int] = set()
+    titles = {_normalize_title(p.get("title", "")): idx for idx, p in enumerate(papers)}
+
+    for item in reviewed_papers:
+        if not isinstance(item, dict):
+            continue
+
+        idx: int | None = None
+        title = _normalize_title(item.get("title", ""))
+        if title and title in titles:
+            idx = titles[title]
+        else:
+            raw_index = item.get("index")
+            try:
+                parsed = int(float(str(raw_index).strip()))
+            except (TypeError, ValueError):
+                parsed = -1
+            if parsed == 0:
+                idx = 0
+            elif 1 <= parsed <= len(papers):
+                idx = parsed - 1
+            elif 0 <= parsed < len(papers):
+                idx = parsed
+
+        if idx is not None and 0 <= idx < len(papers) and idx not in seen:
+            selected.append(papers[idx])
+            seen.add(idx)
+
+    return selected
+
+
 
 class ArxivAgent:
     """ArXiv 论文检索 Agent（支持多轮对话）"""
 
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None,
                  max_search_rounds: int = None, max_results_per_round: int = None,
-                 providers: list[str] = None, provider_settings: dict[str, str] = None):
+                 providers: list[str] = None, provider_settings: dict[str, str] = None,
+                 cancel_event=None):
+        import threading
         self.api_key = api_key or config.DEEPSEEK_API_KEY
         self.base_url = base_url or config.DEEPSEEK_BASE_URL
         self.model = model or config.DEEPSEEK_MODEL
         self.max_search_rounds = max_search_rounds or config.MAX_SEARCH_ROUNDS
         self.max_results_per_round = max_results_per_round or config.MAX_RESULTS_PER_ROUND
         self.memory = Memory()
-        self.system_prompt = llm.load_prompt("system.txt")
+        self.system_prompt = (
+            llm.load_prompt("system.txt")
+            + f"\n\n当前日期：{date.today().isoformat()}。当用户说“最新”“今年”“当前”或给出年份时，必须以这个日期为准，不要假设当前年份是 2025。"
+        )
         self._has_searched = False  # 是否已经进行过检索
         self.provider_names = providers
         self.provider_settings = provider_settings or {}
@@ -62,6 +167,8 @@ class ArxivAgent:
             providers=self.provider_names,
             provider_settings=self.provider_settings,
         )
+        # 取消令牌：被 set 后，下一次 LLM token / 检索边界会抛 CancelledError
+        self.cancel_event = cancel_event if cancel_event is not None else threading.Event()
 
     def update_config(self, api_key: str = None, base_url: str = None, model: str = None,
                       max_search_rounds: int = None, max_results_per_round: int = None,
@@ -93,8 +200,14 @@ class ArxivAgent:
         self._has_searched = False
 
     def _stream_chat(self, messages: list):
-        """代理流式对话调用，支持动态参数"""
-        return llm.stream_chat(messages, api_key=self.api_key, base_url=self.base_url, model=self.model)
+        """代理流式对话调用，支持动态参数；透传取消令牌。"""
+        return llm.stream_chat(messages, api_key=self.api_key, base_url=self.base_url,
+                               model=self.model, cancel_event=self.cancel_event)
+
+    def _check_cancelled(self):
+        """在循环边界调用；若已取消则抛 CancelledError。"""
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise CancelledError("cancelled at agent boundary")
 
     @property
     def has_context(self) -> bool:
@@ -275,10 +388,16 @@ class ArxivAgent:
                 provider_query = " ".join(str(k) for k in keywords)
             strategy = query_result.get("strategy", "")
             sort_by = query_result.get("sort_by", "relevance")
-            max_results = min(query_result.get("max_results", 10), self.max_results_per_round)
+            max_results = _coerce_int(
+                query_result.get("max_results", 10),
+                default=min(10, self.max_results_per_round),
+                min_value=1,
+                max_value=self.max_results_per_round,
+            )
 
             # ===== 迭代检索循环 =====
             for round_num in range(1, self.max_search_rounds + 1):
+                self._check_cancelled()
 
                 # --- 执行检索（含错误恢复） ---
                 papers, search_success = yield from self._execute_search_with_recovery(
@@ -322,16 +441,7 @@ class ArxivAgent:
 
                 # 从审核中获取相关论文
                 reviewed_papers = review_result.get("relevant_papers")
-                relevant_indices = {
-                    p["index"] for p in reviewed_papers or []
-                    if isinstance(p, dict) and "index" in p
-                }
-                if reviewed_papers is None:
-                    relevant_papers = papers
-                else:
-                    relevant_papers = [
-                        papers[i] for i in relevant_indices if i < len(papers)
-                    ]
+                relevant_papers = _select_relevant_papers(reviewed_papers, papers)
 
                 # 记录本轮
                 self.memory.add_search_round(
@@ -349,8 +459,8 @@ class ArxivAgent:
                                        "relevant_papers": relevant_papers})
 
                 # --- 决策：是否需要继续优化 ---
-                should_refine = review_result.get("should_refine", False)
-                quality = review_result.get("overall_quality", 1.0)
+                should_refine = _coerce_bool(review_result.get("should_refine", False), False)
+                quality = _coerce_float(review_result.get("overall_quality", 1.0), 1.0, 0.0, 1.0)
 
                 if not should_refine or round_num >= self.max_search_rounds:
                     if round_num >= self.max_search_rounds and should_refine:
@@ -372,8 +482,12 @@ class ArxivAgent:
                     strategy = refine_result.get("changes_made", [])
                     strategy = "；".join(strategy) if isinstance(strategy, list) else str(strategy)
                     sort_by = refine_result.get("sort_by", sort_by)
-                    max_results = min(refine_result.get("max_results", max_results),
-                                      self.max_results_per_round)
+                    max_results = _coerce_int(
+                        refine_result.get("max_results", max_results),
+                        default=max_results,
+                        min_value=1,
+                        max_value=self.max_results_per_round,
+                    )
 
                     yield AgentEvent(EventType.REFINE, round_num=round_num,
                                      step_name="策略已优化",
@@ -393,6 +507,7 @@ class ArxivAgent:
                 all_chunks = []
                 from core import pdf_parser
                 for p in final_papers:
+                    self._check_cancelled()
                     pdf_link = p.get("pdf_link", "")
                     title = p.get("title", "无标题")
                     if pdf_link:
@@ -418,18 +533,25 @@ class ArxivAgent:
 
             report_text = yield from self._step_report(user_query, final_papers)
 
-            self.memory.set_final_results(final_papers, report_text)
+            self.memory.set_final_results(final_papers, report_text, self.memory.evidence_chunks)
             self.memory.add_conversation("assistant", report_text)
 
             yield AgentEvent(EventType.DONE, step_name="完成",
                              content="✅ 检索完成！",
                              data={"final_papers": final_papers,
-                                   "report": report_text})
+                                   "report": report_text,
+                                   "evidence": self.memory.evidence_chunks})
 
+        except CancelledError:
+            # 取消是预期内的正常终态，不带堆栈
+            yield AgentEvent(EventType.DONE, step_name="已取消",
+                             content="已停止当前检索。",
+                             data={"cancelled": True})
         except Exception as e:
             tb = traceback.format_exc()
+            _safe_log(f"[ERROR] Agent run failed: {e}\n{tb}")
             yield AgentEvent(EventType.ERROR,
-                             content=f"❌ Agent 运行出错: {e}\n{tb}")
+                             content=f"Agent 运行出错: {e}")
 
     # ===================== 带错误恢复的检索 =====================
 
@@ -444,6 +566,7 @@ class ArxivAgent:
         current_query = arxiv_query
 
         for recovery_attempt in range(config.MAX_ERROR_RECOVERY + 1):
+            self._check_cancelled()
             is_retry = recovery_attempt > 0
             retry_label = f"（重试 {recovery_attempt}）" if is_retry else ""
             providers = self.search_service.provider_labels()
@@ -461,6 +584,7 @@ class ArxivAgent:
                 natural_query=natural_query,
                 max_results=max_results,
                 sort_by=sort_by,
+                cancel_event=self.cancel_event,
             )
 
             # 检索成功且有结果
@@ -541,7 +665,7 @@ class ArxivAgent:
                 retriever.build_index(chunks)
                 return retriever, retriever.index_summary
             except Exception as e:
-                print(f"⚠️ Hybrid RAG 初始化失败，降级为 TF-IDF: {e}")
+                _safe_log(f"[WARN] Hybrid RAG initialization failed; falling back to TF-IDF: {e}")
 
         retriever = TFIDFRetriever()
         retriever.build_index(chunks)
@@ -620,15 +744,19 @@ class ArxivAgent:
     def _step_report(self, user_query: str, final_papers: list[dict]):
         """生成最终报告"""
         papers_text = arxiv_search.format_papers_for_llm(final_papers)
-        
+
         # 检索正文切片 (RAG)
         rag_context = ""
+        retrieved: list[dict] = []
         if hasattr(self, "retriever") and self.retriever and self.retriever.chunks:
             retrieved = self.retriever.retrieve(user_query, top_k=config.RAG_TOP_K)
             if retrieved:
                 rag_context = _format_rag_context(retrieved)
         if not rag_context:
             rag_context = "（未提供正文切片，请仅使用已有摘要信息生成报告）"
+
+        # 把命中的证据切片保存到 memory，供报告引用回溯（不再丢弃）
+        self.memory.evidence_chunks = retrieved or []
 
         prompt_content = llm.load_prompt(
             "summary.txt",

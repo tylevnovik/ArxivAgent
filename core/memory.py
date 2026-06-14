@@ -16,10 +16,35 @@ class SearchRound:
     review: dict            # LLM 审核结果
     relevant_papers: list[dict]  # 筛选出的相关论文
     timestamp: str = ""
-    
+
     def __post_init__(self):
         if not self.timestamp:
             self.timestamp = datetime.now().isoformat()
+
+    def serialize(self) -> dict:
+        """无损序列化（保留 results / relevant_papers / 完整 review），用于线程持久化。"""
+        return {
+            "round_number": self.round_number,
+            "query": self.query,
+            "strategy": self.strategy,
+            "results": self.results,
+            "review": self.review,
+            "relevant_papers": self.relevant_papers,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "SearchRound":
+        """从 serialize() 的产物重建。缺失字段用安全默认值补齐。"""
+        return cls(
+            round_number=int(data.get("round_number", 0) or 0),
+            query=str(data.get("query", "") or ""),
+            strategy=str(data.get("strategy", "") or ""),
+            results=list(data.get("results", []) or []),
+            review=dict(data.get("review", {}) or {}),
+            relevant_papers=list(data.get("relevant_papers", []) or []),
+            timestamp=str(data.get("timestamp", "") or ""),
+        )
 
 
 class Memory:
@@ -31,6 +56,7 @@ class Memory:
         self.conversation: list[dict] = []  # 对话历史 (role, content)
         self.final_papers: list[dict] = []  # 最终推荐论文
         self.final_report: str = ""         # 最终报告
+        self.evidence_chunks: list[dict] = []  # 报告引用的正文证据切片（RAG 命中）
     
     def set_user_query(self, query: str):
         """设置用户原始需求"""
@@ -92,13 +118,15 @@ class Memory:
                     papers.append(paper)
         return papers
     
-    def set_final_results(self, papers: list[dict], report: str):
-        """设置最终结果"""
+    def set_final_results(self, papers: list[dict], report: str, evidence: list[dict] = None):
+        """设置最终结果（论文、报告、可选的证据切片）。"""
         self.final_papers = papers
         self.final_report = report
+        if evidence is not None:
+            self.evidence_chunks = evidence
     
-    def to_dict(self) -> dict:
-        """序列化为字典"""
+    def summary_dict(self) -> dict:
+        """轻量摘要（仅计数 + 摘要文本），供调试/日志使用，不可用于持久化。"""
         return {
             "user_query": self.user_query,
             "conversation": self.conversation,
@@ -118,7 +146,38 @@ class Memory:
             "final_papers": self.final_papers,
             "final_report": self.final_report,
         }
-    
+
+    # 向后兼容别名：旧代码可能仍调用 to_dict()。
+    to_dict = summary_dict
+
+    def serialize(self) -> dict:
+        """无损序列化整个 Memory，用于线程 JSON 持久化（可被 deserialize 还原）。"""
+        return {
+            "user_query": self.user_query,
+            "conversation": self.conversation,
+            "search_rounds": [sr.serialize() for sr in self.search_rounds],
+            "final_papers": self.final_papers,
+            "final_report": self.final_report,
+            "evidence_chunks": self.evidence_chunks,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "Memory":
+        """从 serialize() 的产物完整重建 Memory。"""
+        mem = cls()
+        if not data:
+            return mem
+        mem.user_query = str(data.get("user_query", "") or "")
+        mem.conversation = list(data.get("conversation", []) or [])
+        mem.search_rounds = [
+            SearchRound.deserialize(sr)
+            for sr in (data.get("search_rounds", []) or [])
+        ]
+        mem.final_papers = list(data.get("final_papers", []) or [])
+        mem.final_report = str(data.get("final_report", "") or "")
+        mem.evidence_chunks = list(data.get("evidence_chunks", []) or [])
+        return mem
+
     def reset(self):
         """重置记忆"""
         self.__init__()
