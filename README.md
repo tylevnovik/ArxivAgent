@@ -131,6 +131,18 @@ ArxivAgent/
 | POST | `/api/config/health` | 探测 LLM / 检索源连通性 |
 | GET | `/api/config/health` | 获取上次探测结果 |
 
+## 数据目录
+
+运行期数据（线程、PDF 缓存、检索缓存、导出文件、Qdrant 索引）默认放在用户数据目录：
+
+- **macOS**：`~/Library/Application Support/arxivagent`
+- **Linux**：`~/.local/share/arxivagent`
+- **Windows**：`%APPDATA%\arxivagent`
+
+可用环境变量 `ARXIV_AGENT_DATA_DIR` 覆盖（桌面端会自动指向 Electron 的 userData 目录）。
+
+> 从旧版本升级：若之前数据写在项目根目录，手动把 `threads/`、`pdf_cache/`、`exports/`、`.cache/` 复制到上述新目录即可。
+
 ## 配置
 
 也可通过 `.env` 文件设置：

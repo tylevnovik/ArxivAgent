@@ -2,6 +2,8 @@
 ArXiv 论文检索 Agent 配置管理
 """
 import os
+
+import platformdirs
 from dotenv import load_dotenv
 
 # 加载本地 .env 文件
@@ -40,8 +42,15 @@ MAX_ERROR_RECOVERY = 2        # 检索错误恢复最大尝试次数
 PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
 
 # 运行期数据目录
+#
+# 默认放用户数据目录（~/.share/arxivagent、~/Library/Application Support/arxivagent、
+# %APPDATA%/arxivagent），避免运行期文件污染源码树、且打包后写到只读目录。
+# 可用环境变量 ARXIV_AGENT_DATA_DIR 覆盖（Electron 桌面端就是这么做的，指向 userData）。
 DATA_DIR = os.path.abspath(
-    os.environ.get("ARXIV_AGENT_DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+    os.environ.get(
+        "ARXIV_AGENT_DATA_DIR",
+        platformdirs.user_data_dir("arxivagent", "arxivagent"),
+    )
 )
 os.makedirs(DATA_DIR, exist_ok=True)
 
