@@ -55,7 +55,9 @@ app = FastAPI(title=f"多源论文检索 Agent v{config.APP_VERSION}")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # 本地后端不走 cookie/凭据，allow_credentials=False 与 allow_origins=["*"]
+    # 是浏览器规范允许的唯一组合（带 credentials 的通配源会被规范禁止）。
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

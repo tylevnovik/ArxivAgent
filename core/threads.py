@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import threading
 from datetime import datetime
@@ -30,6 +31,16 @@ def _now_iso() -> str:
 def _new_thread_id() -> str:
     # 短而唯一的线程 id（前端列表 key 与文件名）
     return datetime.now().strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(4)
+
+
+# thread_id 只允许字母、数字、下划线、连字符，杜绝路径穿越（../、/、%2e 等）。
+# _new_thread_id 生成的 id 天然符合，这里是对外部输入（URL 路径参数）的防御。
+_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_valid_thread_id(thread_id: str) -> bool:
+    """校验 thread_id 是否只含安全字符，避免被拼进文件路径时穿越目录。"""
+    return bool(thread_id) and bool(_THREAD_ID_RE.match(thread_id))
 
 
 class Thread:
@@ -196,6 +207,9 @@ class ThreadManager:
         return entries
 
     def get(self, thread_id: str) -> Optional[Thread]:
+        # 防御路径穿越：thread_id 来自 URL 路径参数，校验后才拼路径
+        if not _is_valid_thread_id(thread_id):
+            return None
         path = os.path.join(config.THREADS_DIR, f"{thread_id}.json")
         if not os.path.exists(path):
             return None
