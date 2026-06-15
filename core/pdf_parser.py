@@ -13,6 +13,9 @@ HEADERS = {
     "User-Agent": "ArxivAgent/1.0 (contact: info@arxivagent.org)"
 }
 
+# 单篇 PDF 下载大小上限（字节）。超过则中止下载，避免恶意/错误链接撑爆磁盘。
+MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
+
 
 def get_arxiv_id(pdf_link: str) -> str:
     """从 pdf_link 中提取 arXiv ID，提取失败则返回 md5 hash 字符串"""
@@ -36,20 +39,39 @@ def download_pdf(pdf_link: str, arxiv_id: str) -> str:
     下载 PDF 文件并保存到本地缓存目录。
     如果已存在，则直接返回本地路径。
     返回保存的本地文件绝对路径。
+
+    流式下载并限制单文件大小（MAX_PDF_BYTES），避免恶意/超大链接撑爆磁盘。
     """
     filename = f"{arxiv_id}.pdf"
     filepath = os.path.join(config.PDF_CACHE_DIR, filename)
-    
+
     if os.path.exists(filepath) and os.path.getsize(filepath) > 1000:
         return filepath
-        
+
     try:
-        response = requests.get(pdf_link, headers=HEADERS, timeout=30)
-        response.raise_for_status()
-        with open(filepath, "wb") as f:
-            f.write(response.content)
+        # stream=True 逐块下载，避免一次性把整个 PDF 读进内存
+        with requests.get(pdf_link, headers=HEADERS, timeout=30, stream=True) as response:
+            response.raise_for_status()
+            written = 0
+            with open(filepath, "wb") as f:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > MAX_PDF_BYTES:
+                        raise RuntimeError(
+                            f"PDF 超过大小上限 {MAX_PDF_BYTES // (1024 * 1024)}MB "
+                            f"({pdf_link})"
+                        )
+                    f.write(chunk)
         return filepath
     except Exception as e:
+        # 下载失败或超限时清理半成品文件，避免后续误判为已缓存
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
         raise RuntimeError(f"下载 PDF 失败 ({pdf_link}): {e}")
 
 

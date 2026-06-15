@@ -398,8 +398,15 @@ def _run_agent_worker(thread: Thread, agent: ArxivAgent, query: str,
             thread.title = (first_user[:30] + ("…" if len(first_user) > 30 else "")) or "新对话"
         try:
             thread.save()
-        except Exception:
-            pass
+        except Exception as save_err:
+            # 持久化失败要让用户知道，而不是静默吞掉（否则 UI 显示成功但下次刷新数据丢了）
+            import traceback as _tb
+            print(f"[ERROR] Thread {thread.id} 持久化失败: {save_err}\n{_tb.format_exc()}",
+                  flush=True)
+            out_queue.put(AgentEventEnvelope(
+                type="error",
+                message=f"⚠️ 检索已完成，但结果未能保存到磁盘：{save_err}。可重试或导出当前结果。",
+            ))
         thread_manager.finish_task(thread.id)
         out_queue.put(None)  # 哨兵
 

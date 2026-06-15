@@ -377,7 +377,7 @@ def _parse_entry(entry) -> Optional[dict]:
             "pdf_link": pdf_link,
             "arxiv_id": arxiv_id,
         }
-    except Exception:
+    except Exception:  # noqa: BLE001 - 单条 entry 解析失败不应中断整批解析
         return None
 
 
