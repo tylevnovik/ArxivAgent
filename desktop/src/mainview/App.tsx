@@ -98,7 +98,7 @@ import {
   updateThreadMessage,
 } from "./api";
 import { applyEvent, withUserMessage } from "./eventReducer";
-import { clearApiKey, hasSecretsBridge, loadApiKey, saveApiKey } from "./secrets";
+import { clearApiKey, hasSecretsBridge, loadApiKey, loadSecret, saveApiKey, saveSecret } from "./secrets";
 import { renderMarkdown } from "./markdown";
 import { extractCitations, matchEvidence } from "./citations-core";
 import { SetupWizard } from "./SetupWizard";
@@ -193,7 +193,8 @@ function App() {
     ),
     openalexMailto: localStorage.getItem("arxiv_agent_openalex_mailto") || "",
     crossrefMailto: localStorage.getItem("arxiv_agent_crossref_mailto") || "",
-    semanticScholarApiKey: localStorage.getItem("arxiv_agent_semantic_scholar_api_key") || "",
+    // Semantic Scholar key 是敏感字段，走 secrets bridge（异步加载，初始空）
+    semanticScholarApiKey: "",
   }));
   const [apiKeyReady, setApiKeyReady] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
@@ -230,18 +231,33 @@ function App() {
     };
   }, []);
 
-  // 启动时从 secrets 加载 API Key；若未配置过则开首屏引导
+  // 启动时从 secrets 加载 API Key 与 provider secret；若未配置过则开首屏引导
   useEffect(() => {
     let cancelled = false;
     (async () => {
       let key = "";
+      let semanticScholarApiKey = "";
       try {
-        key = await loadApiKey();
+        [key, semanticScholarApiKey] = await Promise.all([loadApiKey(), loadSecret("semantic_scholar_api_key")]);
       } catch (err) {
         console.warn("加载 API Key 失败", err);
       }
       if (cancelled) return;
-      setConfig((prev) => ({ ...prev, apiKey: key }));
+      setConfig((prev) => ({ ...prev, apiKey: key, semanticScholarApiKey }));
+
+      // 一次性迁移：旧版本把 Semantic Scholar key 明文存 localStorage，迁移到 secrets 后清掉。
+      const legacyS2 = localStorage.getItem("arxiv_agent_semantic_scholar_api_key");
+      if (legacyS2 && !semanticScholarApiKey) {
+        try {
+          await saveSecret("semantic_scholar_api_key", legacyS2);
+          setConfig((prev) => ({ ...prev, semanticScholarApiKey: legacyS2 }));
+          semanticScholarApiKey = legacyS2;
+        } catch (err) {
+          console.warn("迁移 Semantic Scholar Key 到安全存储失败", err);
+        }
+      }
+      localStorage.removeItem("arxiv_agent_semantic_scholar_api_key");
+
       setApiKeyReady(true);
       // 未配置过 Key（secrets 与 has_api_key 标志都无）→ 开引导
       const configured = Boolean(key) || localStorage.getItem("arxiv_agent_has_api_key") === "1";
@@ -673,13 +689,19 @@ function App() {
       localStorage.setItem("arxiv_agent_providers", next.providers.join(","));
       localStorage.setItem("arxiv_agent_openalex_mailto", next.openalexMailto);
       localStorage.setItem("arxiv_agent_crossref_mailto", next.crossrefMailto);
-      localStorage.setItem("arxiv_agent_semantic_scholar_api_key", next.semanticScholarApiKey);
       localStorage.setItem("arxiv_agent_has_api_key", next.apiKey ? "1" : "0");
       try {
         await saveApiKey(next.apiKey);
       } catch (err) {
         console.warn("保存 API Key 到安全存储失败，回退内存", err);
         notify("API Key 未能写入系统安全存储，本次仅保存在内存", "warning");
+      }
+      // Semantic Scholar Key 是敏感字段，走 secrets bridge（与主 Key 策略一致）
+      try {
+        await saveSecret("semantic_scholar_api_key", next.semanticScholarApiKey);
+      } catch (err) {
+        console.warn("保存 Semantic Scholar Key 到安全存储失败，回退内存", err);
+        notify("Semantic Scholar Key 未能写入系统安全存储，本次仅保存在内存", "warning");
       }
       setConfig(next);
       setSettingsOpen(false);

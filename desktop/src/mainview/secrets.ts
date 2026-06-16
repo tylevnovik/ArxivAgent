@@ -82,3 +82,41 @@ export async function clearApiKey(): Promise<void> {
   }
   localStorage.removeItem(LOCAL_KEY);
 }
+
+/**
+ * 通用 secret 读取（供 provider 专用 key 等使用）。
+ * 有 Electron bridge 走 safeStorage，否则开发模式回退 localStorage。
+ */
+export async function loadSecret(key: string): Promise<string> {
+  const bridge = getDesktop()?.secrets;
+  if (bridge) {
+    try {
+      return (await bridge.get(key)) ?? "";
+    } catch (err) {
+      console.warn(`从 safeStorage 读取 ${key} 失败，回退空`, err);
+      return "";
+    }
+  }
+  return localStorage.getItem(key) ?? "";
+}
+
+/**
+ * 通用 secret 写入。有 bridge 走 safeStorage，否则开发模式回退 localStorage。
+ * 空值表示删除。
+ */
+export async function saveSecret(key: string, value: string): Promise<void> {
+  const bridge = getDesktop()?.secrets;
+  if (bridge) {
+    if (value) {
+      await bridge.set(key, value);
+    } else {
+      await bridge.delete(key);
+    }
+    return;
+  }
+  if (value) {
+    localStorage.setItem(key, value);
+  } else {
+    localStorage.removeItem(key);
+  }
+}

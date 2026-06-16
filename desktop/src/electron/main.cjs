@@ -75,7 +75,9 @@ function readSecretsStore() {
 function writeSecretsStore(store) {
 	const file = secretsFile();
 	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, JSON.stringify(store, null, 2), { encoding: "utf-8" });
+	// mode: 0o600 限制只有所有者可读写。Linux 无 keyring 时 safeStorage 回退明文，
+	// 此权限防止同机其他用户读到 API Key。Windows 上 mode 被忽略，无副作用。
+	fs.writeFileSync(file, JSON.stringify(store, null, 2), { encoding: "utf-8", mode: 0o600 });
 }
 
 function registerSecretsHandlers() {
@@ -123,11 +125,11 @@ function registerBackendHandlers() {
 	// 诊断：返回解释器/依赖/health 状态，供渲染进程向导展示
 	ipcMain.handle("backend:diagnose", async () => diagnoseBackend());
 
-	// 重试：停止旧进程并重新走启动流程，返回是否成功
+	// 重试：停止旧进程并重新走启动流程，返回是否成功（带诊断原因）
 	ipcMain.handle("backend:retry", async () => {
 		stopPythonBackend();
-		const ok = await startPythonBackend();
-		return { ok };
+		const result = await startPythonBackend();
+		return { ok: result.ok, error: result.error || null };
 	});
 }
 
@@ -357,13 +359,13 @@ async function diagnoseBackend() {
 async function startPythonBackend() {
 	if (await isBackendHealthy()) {
 		console.log(`[Electron Main] Backend already healthy at ${BACKEND_URL}.`);
-		return true;
+		return { ok: true };
 	}
 
 	const backendRoot = findBackendRoot();
 	if (!backendRoot) {
 		console.error("[Electron Main] Could not find Python backend app.py.");
-		return false;
+		return { ok: false, error: "未找到后端代码 app.py" };
 	}
 
 	const pythonInfo = findPythonPath(backendRoot);
@@ -373,10 +375,16 @@ async function startPythonBackend() {
 	fs.mkdirSync(backendDataDir, { recursive: true });
 	console.log(`[Electron Main] Spawning Python process: ${pythonPath} ${appPyPath}`);
 
+	// 记录最近一段 stderr，用于在 ready 失败时给出诊断（端口占用 / 依赖缺失等）。
+	let lastStderr = "";
+	let exitedEarly = false;
+	let exitInfo = null;
+
 	try {
 		pythonProc = spawn(pythonPath, [appPyPath], {
 			cwd: backendRoot,
-			stdio: "inherit",
+			// stdio: inherit 仍把日志透传到 Electron 控制台；额外捕获 stderr 副本用于诊断。
+			stdio: ["inherit", "inherit", "pipe"],
 			env: {
 				...buildPythonEnv(pythonInfo),
 				ARXIV_AGENT_HOST: "127.0.0.1",
@@ -389,20 +397,41 @@ async function startPythonBackend() {
 		});
 
 		console.log(`[Electron Main] Python process spawned (PID: ${pythonProc.pid}).`);
+		pythonProc.stderr?.on("data", (d) => {
+			const text = d.toString();
+			lastStderr = (lastStderr + text).slice(-2000);
+		});
 		pythonProc.once("exit", (code, signal) => {
 			console.log(`[Electron Main] Python backend exited with code ${code}, signal ${signal}.`);
+			exitedEarly = true;
+			exitInfo = { code, signal };
 			pythonProc = null;
 		});
 	} catch (err) {
 		console.error("[Electron Main] Failed to spawn Python backend:", err);
-		return false;
+		return { ok: false, error: `无法启动后端进程: ${err.message}` };
 	}
 
 	const ready = await waitForUrl(`${BACKEND_URL}/api/health`, 15000, { method: "GET" });
-	if (!ready) {
-		console.error(`[Electron Main] Backend did not become healthy at ${BACKEND_URL}.`);
+	if (ready) {
+		return { ok: true };
 	}
-	return ready;
+
+	// ready 失败：尽量给出可读原因。
+	console.error(`[Electron Main] Backend did not become healthy at ${BACKEND_URL}.`);
+	let reason;
+	if (exitedEarly) {
+		const hint = /EADDRINUSE|address already in use/i.test(lastStderr)
+			? `端口 ${BACKEND_PORT} 可能被占用`
+			: /ModuleNotFoundError|ImportError/.test(lastStderr)
+				? "依赖缺失"
+				: `进程提前退出（code=${exitInfo?.code}）`;
+		reason = `后端启动后立即退出：${hint}。详见控制台日志。`;
+	} else {
+		// 进程还活着但 health 不通 —— 可能还在初始化（Qdrant 模型加载较慢）。
+		reason = `后端进程在运行，但 15s 内未响应 health 检查（可能在加载模型或下载依赖）。`;
+	}
+	return { ok: false, error: reason };
 }
 
 async function getRendererUrl() {
@@ -421,9 +450,10 @@ async function getRendererUrl() {
 }
 
 function findRendererIndexHtml() {
+	// 不再用 process.cwd() 作为候选 —— 打包后它指向用户任意目录，
+	// 是误判来源（见 findPythonPath 同名注释）。
 	const candidates = [
 		path.join(app.getAppPath(), "dist", "index.html"),
-		path.resolve(process.cwd(), "dist", "index.html"),
 		path.resolve(__dirname, "..", "..", "dist", "index.html"),
 	];
 	const indexHtml = candidates.find((candidate) => fs.existsSync(candidate));
@@ -529,7 +559,7 @@ app.on("activate", () => {
 });
 
 async function bootstrap() {
-	const [backendReady, rendererUrl] = await Promise.all([
+	const [backendResult, rendererUrl] = await Promise.all([
 		startPythonBackend(),
 		getRendererUrl(),
 	]);
@@ -537,18 +567,19 @@ async function bootstrap() {
 	if (isSmokeTest) {
 		const rendererReady = await isRendererAvailable(rendererUrl);
 		console.log(JSON.stringify({
-			backendReady,
+			backendReady: backendResult.ok,
+			backendError: backendResult.error || null,
 			rendererReady,
 			rendererUrl,
 			packaged: app.isPackaged,
 		}));
 		stopPythonBackend();
-		app.exit(backendReady && rendererReady ? 0 : 1);
+		app.exit(backendResult.ok && rendererReady ? 0 : 1);
 		return;
 	}
 
-	if (!backendReady) {
-		console.warn("[Electron Main] Backend is not healthy; renderer will still open.");
+	if (!backendResult.ok) {
+		console.warn(`[Electron Main] Backend is not healthy: ${backendResult.error || "未知原因"}。renderer will still open.`);
 	}
 
 	createWindow(rendererUrl);
