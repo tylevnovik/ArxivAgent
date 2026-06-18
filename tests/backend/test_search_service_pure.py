@@ -20,10 +20,22 @@ from core.search_service import (
 # ===================== _extract_year_bounds =====================
 
 class TestExtractYearBounds:
-    def test_submitted_date_range(self):
-        # arXiv submittedDate 区间：代码正则期望 4 位年 + 8 位（共 12 位）日期
+    def test_submitted_date_range_12digit(self):
+        # arXiv 标准 12 位（YYYYMMDDHHMM），prompt 教 LLM 输出的格式
         lo, hi = _extract_year_bounds(
             "test", 'ti:rag submittedDate:[202001010000 TO 202212310000]'
+        )
+        assert lo == 2020 and hi == 2022
+
+    def test_submitted_date_range_8digit(self):
+        # 健壮性：兼容 8 位（YYYYMMDD）
+        lo, hi = _extract_year_bounds("test", 'submittedDate:[20200101 TO 20221231]')
+        assert lo == 2020 and hi == 2022
+
+    def test_submitted_date_range_14digit(self):
+        # 健壮性：兼容 14 位（YYYYMMDDHHMMSS）
+        lo, hi = _extract_year_bounds(
+            "test", 'submittedDate:[20200101000000 TO 20221231235959]'
         )
         assert lo == 2020 and hi == 2022
 

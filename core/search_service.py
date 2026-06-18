@@ -578,8 +578,10 @@ def _append_filter(existing: str, extra: str) -> str:
 
 def _extract_year_bounds(*texts: str) -> tuple[Optional[int], Optional[int]]:
     joined = " ".join(texts)
+    # submittedDate:[YYYY... TO YYYY...]。arXiv 标准是 12 位（YYYYMMDDHHMM），
+    # 但兼容 8 位（YYYYMMDD）与 14 位（YYYYMMDDHHMMSS），只取前 4 位年份。
     submitted = re.search(
-        r"submittedDate:\[(\d{4})\d{8}\s+TO\s+(\d{4})\d{8}\]",
+        r"submittedDate:\[(\d{4})\d{4,10}\s+TO\s+(\d{4})\d{4,10}\]",
         joined,
         re.IGNORECASE,
     )
