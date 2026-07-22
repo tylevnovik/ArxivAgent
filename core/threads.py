@@ -270,6 +270,14 @@ class ThreadManager:
         handle.cancel_event.set()
         return True
 
+    def cancel_all(self) -> None:
+        """取消所有正在运行的任务（优雅关闭时调用）。"""
+        with self._lock:
+            handles = list(self._tasks.values())
+        for handle in handles:
+            if not handle.finished.is_set():
+                handle.cancel_event.set()
+
 
 # 进程级单例：app.py 直接 import 使用
 thread_manager = ThreadManager()

@@ -92,3 +92,9 @@ RAG_ENABLE_RERANKER = os.environ.get("RAG_ENABLE_RERANKER", "false").strip().low
     "1", "true", "yes", "on"
 }
 RAG_RERANKER_MODEL = os.environ.get("RAG_RERANKER_MODEL", "BAAI/bge-reranker-base")
+
+# API 认证配置
+# AUTH_ENABLED=true（默认）启用 HMAC 签名验证；设为 false 仅限开发调试。
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}

@@ -6,3 +6,7 @@ exports/
 pdf_cache/
 app_backup.py
 .idea/
+
+# 第三方参考项目（仅用于架构对比，不属于本项目代码）
+reference-pasa/
+pasa/

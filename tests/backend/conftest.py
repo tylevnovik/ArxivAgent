@@ -30,6 +30,8 @@ def isolated_data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "EXPORT_DIR", str(export_dir), raising=False)
     monkeypatch.setattr(config, "SEARCH_CACHE_DIR", str(data_dir / ".cache" / "search"), raising=False)
     monkeypatch.setattr(config, "PDF_CACHE_DIR", str(data_dir / "pdf_cache"), raising=False)
+    # 关闭 HMAC 认证，保持现有测试免签名
+    monkeypatch.setattr(config, "AUTH_ENABLED", False)
     yield str(data_dir)
 
 

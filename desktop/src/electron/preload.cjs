@@ -25,6 +25,9 @@ contextBridge.exposeInMainWorld("arxivAgentDesktop", {
 		diagnose: () => ipcRenderer.invoke("backend:diagnose"),
 		retry: () => ipcRenderer.invoke("backend:retry"),
 	},
+	auth: {
+		getToken: () => ipcRenderer.invoke("auth:getToken"),
+	},
 	windowControls: {
 		minimize: () => ipcRenderer.send("window:minimize"),
 		toggleMaximize: () => ipcRenderer.send("window:toggleMaximize"),

@@ -18,6 +18,13 @@ let mainWindow = null;
 let pythonProc = null;
 let isQuitting = false;
 const isSmokeTest = process.argv.includes("--smoke-test");
+const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 3000;
+const FORCE_KILL_WAIT_MS = 2000;
+
+// ===================== HMAC 认证 Token =====================
+// Python 后端启动时通过 stdout 输出 ARXIV_AGENT_AUTH_TOKEN=<hex>，
+// Electron 主进程捕获后存于此，通过 IPC 传给渲染进程。
+let currentAuthToken = null;
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -133,6 +140,13 @@ function registerBackendHandlers() {
 	});
 }
 
+function registerAuthHandlers() {
+	// 返回当前后端的 HMAC token（供渲染进程签名请求用）。
+	ipcMain.handle("auth:getToken", () => {
+		return currentAuthToken;
+	});
+}
+
 function registerWindowHandlers() {
 	ipcMain.on("window:minimize", (event) => {
 		BrowserWindow.fromWebContents(event.sender)?.minimize();
@@ -146,9 +160,137 @@ function registerWindowHandlers() {
 			win.maximize();
 		}
 	});
-	ipcMain.on("window:close", (event) => {
-		BrowserWindow.fromWebContents(event.sender)?.close();
-	});
+		ipcMain.on("window:close", (event) => {
+			BrowserWindow.fromWebContents(event.sender)?.close();
+		});
+	}
+
+// ===================== PID 文件 & 进程清理 =====================
+
+function pidFilePath() {
+	return path.join(app.getPath("userData"), "backend-data", "backend.pid");
+}
+
+/**
+ * 从 PID 文件读取残留进程 PID，检查进程是否仍存在。
+ * 返回 { pid, alive } 或 null（文件不存在）。
+ */
+function readStalePidFile() {
+	const file = pidFilePath();
+	try {
+		if (!fs.existsSync(file)) return null;
+		const pid = parseInt(fs.readFileSync(file, "utf-8").trim(), 10);
+		if (isNaN(pid) || pid <= 0) return { pid: null, alive: false };
+		// 检查进程是否存活
+		try {
+			process.kill(pid, 0); // signal 0 = 探测
+			return { pid, alive: true };
+		} catch {
+			return { pid, alive: false };
+		}
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * 删除 PID 文件（忽略错误）。
+ */
+function removePidFile() {
+	try {
+		const file = pidFilePath();
+		if (fs.existsSync(file)) fs.unlinkSync(file);
+	} catch {
+		// ignore
+	}
+}
+
+/**
+ * 尝试通过 HTTP POST /api/shutdown 优雅关闭后端。
+ * 返回 true 表示关闭请求已发送（不保证进程已退出）。
+ */
+async function gracefulShutdownBackend() {
+	try {
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), GRACEFUL_SHUTDOWN_TIMEOUT_MS);
+		const res = await fetch(`${BACKEND_URL}/api/shutdown`, {
+			method: "POST",
+			signal: controller.signal,
+		});
+		clearTimeout(timer);
+		return res.ok;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * 强制杀死一个 PID 对应的进程及其子进程树。
+ */
+function forceKillPid(pid) {
+	if (!pid || pid <= 0) return;
+	console.log(`[Electron Main] Force killing PID ${pid}.`);
+	if (process.platform === "win32") {
+		spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+	} else {
+		try {
+			process.kill(-pid, "SIGKILL"); // 杀进程组
+		} catch {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// 进程可能已退出
+			}
+		}
+	}
+}
+
+/**
+ * 清理残留后端进程：PID 文件 → 优雅关闭 → 强制杀 → 等待端口释放。
+ * 在启动新后端前调用。
+ */
+async function cleanupStaleBackend() {
+	const stale = readStalePidFile();
+	if (!stale || !stale.alive) {
+		// PID 文件不存在或进程已退出 → 清理文件即可
+		removePidFile();
+		return;
+	}
+
+	console.log(`[Electron Main] 检测到残留后端进程 PID ${stale.pid}，正在清理…`);
+
+	// 1. 尝试优雅关闭（HTTP）
+	const shutdownOk = await gracefulShutdownBackend();
+
+	// 2. 等待进程退出
+	if (shutdownOk) {
+		const deadline = Date.now() + FORCE_KILL_WAIT_MS;
+		while (Date.now() < deadline) {
+			try {
+				process.kill(stale.pid, 0);
+				await sleep(200);
+			} catch {
+				// 进程已退出
+				break;
+			}
+		}
+	}
+
+	// 3. 检查是否还在，如果还活着就强制杀
+	try {
+		process.kill(stale.pid, 0);
+		forceKillPid(stale.pid);
+		// 等端口释放
+		await sleep(1000);
+	} catch {
+		// 进程已退出
+	}
+
+	removePidFile();
+	console.log("[Electron Main] 残留后端进程清理完成。");
 }
 
 function findBackendRoot() {
@@ -357,8 +499,18 @@ async function diagnoseBackend() {
 }
 
 async function startPythonBackend() {
+	// 1. 检查是否已有健康的后端（可能是上次残留或手动启动的）
 	if (await isBackendHealthy()) {
 		console.log(`[Electron Main] Backend already healthy at ${BACKEND_URL}.`);
+		return { ok: true };
+	}
+
+	// 2. 清理残留进程（PID 文件 + 端口探测 + 强制杀）
+	await cleanupStaleBackend();
+
+	// 二次检查：清理后端口可能就释放了
+	if (await isBackendHealthy()) {
+		console.log(`[Electron Main] Backend became healthy after cleanup.`);
 		return { ok: true };
 	}
 
@@ -373,6 +525,7 @@ async function startPythonBackend() {
 	const appPyPath = path.join(backendRoot, "app.py");
 	const backendDataDir = path.join(app.getPath("userData"), "backend-data");
 	fs.mkdirSync(backendDataDir, { recursive: true });
+	const pidFile = path.join(backendDataDir, "backend.pid");
 	console.log(`[Electron Main] Spawning Python process: ${pythonPath} ${appPyPath}`);
 
 	// 记录最近一段 stderr，用于在 ready 失败时给出诊断（端口占用 / 依赖缺失等）。
@@ -383,22 +536,54 @@ async function startPythonBackend() {
 	try {
 		pythonProc = spawn(pythonPath, [appPyPath], {
 			cwd: backendRoot,
-			// stdio: inherit 仍把日志透传到 Electron 控制台；额外捕获 stderr 副本用于诊断。
-			stdio: ["inherit", "inherit", "pipe"],
+			// stdin 忽略；stdout 捕获（解析 auth token）；stderr 捕获副本用于诊断，
+			// 同时在 data handler 中转发到 process.stderr 保持控制台日志可见性。
+			stdio: ["ignore", "pipe", "pipe"],
 			env: {
 				...buildPythonEnv(pythonInfo),
 				ARXIV_AGENT_HOST: "127.0.0.1",
 				ARXIV_AGENT_PORT: String(BACKEND_PORT),
 				ARXIV_AGENT_DATA_DIR: backendDataDir,
+				ARXIV_AGENT_PIDFILE: pidFile,
 				PYTHONDONTWRITEBYTECODE: "1",
 				PYTHONUNBUFFERED: "1",
 			},
 			windowsHide: true,
 		});
 
+		// 从 Python 后端 stdout 捕获 auth token。
+		// Python 启动时会输出 "ARXIV_AGENT_AUTH_TOKEN=<hex>"，我们解析后存入 currentAuthToken。
+		let stdoutBuffer = "";
+		if (pythonProc.stdout) {
+			pythonProc.stdout.on("data", (chunk) => {
+				const text = chunk.toString("utf-8");
+				stdoutBuffer += text;
+				// 逐行扫描 token 标记
+				const lines = stdoutBuffer.split("\n");
+				stdoutBuffer = lines.pop() || "";
+				for (const line of lines) {
+					const trimmed = line.trim();
+					if (trimmed.startsWith("ARXIV_AGENT_AUTH_TOKEN=")) {
+						currentAuthToken = trimmed.slice("ARXIV_AGENT_AUTH_TOKEN=".length);
+						console.log("[Electron Main] Captured HMAC auth token from backend.");
+					}
+				}
+			});
+			pythonProc.stdout.on("end", () => {
+				// 处理最后可能没有换行的残余
+				if (stdoutBuffer.trim().startsWith("ARXIV_AGENT_AUTH_TOKEN=")) {
+					currentAuthToken = stdoutBuffer.trim().slice("ARXIV_AGENT_AUTH_TOKEN=".length);
+					console.log("[Electron Main] Captured HMAC auth token from backend (flush).");
+				}
+			});
+		}
+
 		console.log(`[Electron Main] Python process spawned (PID: ${pythonProc.pid}).`);
 		pythonProc.stderr?.on("data", (d) => {
 			const text = d.toString();
+			// 转发到 Electron 控制台（替代 stdio: inherit 的透传行为）
+			process.stderr.write(text);
+			// 同时保留最近一段用于诊断
 			lastStderr = (lastStderr + text).slice(-2000);
 		});
 		pythonProc.once("exit", (code, signal) => {
@@ -406,6 +591,7 @@ async function startPythonBackend() {
 			exitedEarly = true;
 			exitInfo = { code, signal };
 			pythonProc = null;
+			currentAuthToken = null;
 		});
 	} catch (err) {
 		console.error("[Electron Main] Failed to spawn Python backend:", err);
@@ -521,29 +707,81 @@ function createWindow(rendererUrl) {
 	}
 }
 
-function stopPythonBackend() {
+/**
+ * 停止 Python 后端：先尝试优雅关闭（HTTP /api/shutdown），超时后强制 kill。
+ * 优先使用 async 版本；同步场景（process.exit）下直接走强制 kill。
+ */
+function stopPythonBackendSync() {
 	if (!pythonProc || pythonProc.killed) {
 		return;
 	}
-
 	const pid = pythonProc.pid;
-	console.log(`[Electron Main] Stopping Python backend PID ${pid}.`);
-
+	console.log(`[Electron Main] Force-stopping Python backend PID ${pid} (sync).`);
 	if (process.platform === "win32") {
 		spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
 			stdio: "ignore",
 			windowsHide: true,
 		});
 	} else {
-		pythonProc.kill("SIGTERM");
+		try {
+			pythonProc.kill("SIGKILL");
+		} catch {
+			// 可能已退出
+		}
+	}
+	pythonProc = null;
+	removePidFile();
+}
+
+async function stopPythonBackend() {
+	// 没有活跃进程 → 检查 PID 文件残留
+	if (!pythonProc || pythonProc.killed) {
+		const stale = readStalePidFile();
+		if (stale?.alive) {
+			await cleanupStaleBackend();
+		}
+		return;
+	}
+
+	const pid = pythonProc.pid;
+	console.log(`[Electron Main] Stopping Python backend PID ${pid} (graceful first).`);
+
+	// 1. 尝试 HTTP 优雅关闭
+	const shutdownOk = await gracefulShutdownBackend();
+
+	if (shutdownOk) {
+		// 等待进程自然退出
+		const deadline = Date.now() + GRACEFUL_SHUTDOWN_TIMEOUT_MS;
+		while (Date.now() < deadline && pythonProc && !pythonProc.killed) {
+			await sleep(200);
+		}
+	}
+
+	// 2. 如果进程还在，强制 kill
+	if (pythonProc && !pythonProc.killed) {
+		console.log(`[Electron Main] Graceful shutdown timed out, force killing PID ${pid}.`);
+		if (process.platform === "win32") {
+			spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+		} else {
+			try {
+				pythonProc.kill("SIGKILL");
+			} catch {
+				// 可能已退出
+			}
+		}
 	}
 
 	pythonProc = null;
+	currentAuthToken = null;
+	removePidFile();
 }
 
 app.on("before-quit", () => {
 	isQuitting = true;
-	stopPythonBackend();
+	void stopPythonBackend();
 });
 
 app.on("window-all-closed", () => {
@@ -588,12 +826,22 @@ async function bootstrap() {
 void app.whenReady().then(() => {
 	registerSecretsHandlers();
 	registerBackendHandlers();
+	registerAuthHandlers();
 	registerWindowHandlers();
 	return bootstrap();
 });
 
 process.on("exit", () => {
 	if (!isQuitting) {
-		stopPythonBackend();
+		stopPythonBackendSync();
 	}
+});
+
+// 兜底：未捕获异常/OOM 等场景也要尝试清理
+process.on("uncaughtException", (err) => {
+	console.error("[Electron Main] Uncaught exception:", err);
+	stopPythonBackendSync();
+});
+process.on("unhandledRejection", (reason) => {
+	console.error("[Electron Main] Unhandled rejection:", reason);
 });

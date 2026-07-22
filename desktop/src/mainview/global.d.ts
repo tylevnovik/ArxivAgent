@@ -16,6 +16,9 @@ declare global {
 				diagnose: () => Promise<BackendDiagnosis>;
 				retry: () => Promise<{ ok: boolean }>;
 			};
+			auth?: {
+				getToken: () => Promise<string | null>;
+			};
 			windowControls?: {
 				minimize: () => void;
 				toggleMaximize: () => void;

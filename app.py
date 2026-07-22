@@ -5,7 +5,9 @@
 import json
 import os
 import queue
+import signal
 import threading
+import atexit
 from datetime import datetime
 from typing import Optional
 
@@ -16,6 +18,13 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from openai import OpenAI
 
 from core.agent import ArxivAgent, EventType, AgentEvent
+from core.auth import (
+    AuthError,
+    generate_keypair,
+    is_public_path,
+    unauthorized_response,
+    verify_request,
+)
 from core.contracts import (
     AgentEventEnvelope,
     CancelResponse,
@@ -48,6 +57,108 @@ import config
 # ===================== 全局状态 =====================
 # 本项目已实现会话状态隔离 (Session Isolation)
 
+# ===================== HMAC 认证密钥 =====================
+# 每次启动生成新密钥对，secret 用于签名，token 用于公开标识。
+_auth_secret: bytes = b""
+_auth_token: bytes = b""
+
+# ===================== 进程管理（PID 文件 + 优雅关闭） =====================
+# PID 文件用于 Electron 主进程追踪后端进程，防止端口残留占用。
+
+_pidfile: str = ""
+_graceful_shutdown_event = threading.Event()
+
+
+def _get_pidfile() -> str:
+    """返回 PID 文件路径。默认 {DATA_DIR}/backend.pid，可通过环境变量覆盖。"""
+    return os.environ.get("ARXIV_AGENT_PIDFILE", os.path.join(config.DATA_DIR, "backend.pid"))
+
+
+def _write_pidfile() -> None:
+    """将当前进程 PID 写入 PID 文件。若文件已存在且对应进程仍存活，抛出 RuntimeError。"""
+    global _pidfile
+    _pidfile = _get_pidfile()
+    # 检查残留 PID 文件
+    if os.path.exists(_pidfile):
+        try:
+            with open(_pidfile, "r") as f:
+                old_pid = int(f.read().strip())
+            if _pid_exists(old_pid) and old_pid != os.getpid():
+                raise RuntimeError(
+                    f"后端进程已在运行（PID {old_pid}），端口可能被占用。"
+                    f"请先关闭现有进程，或删除 PID 文件 {_pidfile}。"
+                )
+        except (ValueError, FileNotFoundError, ProcessLookupError):
+            pass  # PID 文件损坏或进程不存在，可以安全覆盖
+    with open(_pidfile, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def _remove_pidfile() -> None:
+    """删除 PID 文件（正常退出时调用）。"""
+    if _pidfile and os.path.exists(_pidfile):
+        try:
+            os.remove(_pidfile)
+        except OSError:
+            pass
+
+
+def _pid_exists(pid: int) -> bool:
+    """检查指定 PID 的进程是否存在。"""
+    try:
+        os.kill(pid, 0)  # signal 0 = 检查进程是否存在
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _request_graceful_shutdown() -> None:
+    """
+    收到 SIGTERM/SIGINT 时调用：通知所有正在运行的 agent 任务取消，
+    并设置 shutdown 事件。uvicorn 会在当前请求处理完后退出。
+    """
+    print("[Backend] 收到终止信号，正在优雅关闭…", flush=True)
+    _graceful_shutdown_event.set()
+    # 取消所有正在运行的任务
+    thread_manager.cancel_all()
+
+
+def _install_signal_handlers() -> None:
+    """安装 SIGTERM/SIGINT 处理器，启用优雅关闭。仅在主线程中生效（测试环境不在主线程）。"""
+    import threading as _threading
+
+    # signal.signal 只能在主线程中调用；TestClient 等测试环境不适用。
+    if _threading.current_thread() is not _threading.main_thread():
+        return
+
+    # 保存原始 handler 避免覆盖 uvicorn 的
+    original_handler = signal.getsignal(signal.SIGTERM)
+
+    def _sigterm_handler(signum, frame):
+        _request_graceful_shutdown()
+        # 调用原始 handler（通常是 uvicorn 的 shutdown）
+        if callable(original_handler) and original_handler not in (signal.SIG_DFL, signal.SIG_IGN):
+            original_handler(signum, frame)
+        else:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # SIGINT (Ctrl+C) 也走优雅关闭
+    original_int = signal.getsignal(signal.SIGINT)
+
+    def _sigint_handler(signum, frame):
+        _request_graceful_shutdown()
+        if callable(original_int) and original_int not in (signal.SIG_DFL, signal.SIG_IGN):
+            original_int(signum, frame)
+        else:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+
 # ===================== FastAPI Web App Setup =====================
 
 app = FastAPI(title=f"多源论文检索 Agent v{config.APP_VERSION}")
@@ -61,6 +172,28 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------- HMAC 认证中间件 ----------
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """对所有非白名单路径验证 HMAC 签名。"""
+    if not config.AUTH_ENABLED:
+        return await call_next(request)
+
+    path = request.url.path
+    if is_public_path(path):
+        return await call_next(request)
+
+    authorization = request.headers.get("authorization")
+    method = request.method.upper()
+    try:
+        verify_request(_auth_secret, _auth_token, authorization, method, path)
+    except AuthError as e:
+        return unauthorized_response(str(e))
+
+    return await call_next(request)
 
 
 # ---------- 错误响应工具 ----------
@@ -682,9 +815,73 @@ def api_thread_export(thread_id: str, body: ExportRequest):
 # ===================== 下载 =====================
 
 
+# ===================== 认证状态端点 =====================
+
+@app.get("/api/auth/status")
+def api_auth_status():
+    """返回当前认证状态（调试用，公开端点）。"""
+    return {
+        "auth_enabled": config.AUTH_ENABLED,
+        "auth_scheme": "HMAC-SHA256" if config.AUTH_ENABLED else "none",
+    }
+
+
+# ===================== 优雅关闭 =====================
+
+@app.post("/api/shutdown")
+def api_shutdown():
+    """
+    请求后端优雅关闭。Electron 主进程调用此端点后，
+    uvicorn 会在当前请求完成后退出。
+
+    注意：此端点受 HMAC 认证保护（不在白名单中），
+    但 Electron 可通过 PID 文件 + 端口探测兜底强制清理。
+    """
+    _request_graceful_shutdown()
+    # 在后台线程中触发 uvicorn 关闭：发送 SIGTERM 给自身进程。
+    # uvicorn 的信号 handler 会接管并完成优雅关闭。
+    threading.Timer(0.1, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+    return {"ok": True, "status": "shutting_down"}
+
+
+# ===================== 启动事件 =====================
+
+@app.on_event("startup")
+def on_startup():
+    """服务启动时：写 PID 文件、生成 HMAC 密钥对、安装 signal handler。"""
+    global _auth_secret, _auth_token
+
+    # PID 文件
+    try:
+        _write_pidfile()
+    except RuntimeError as e:
+        print(f"[Backend] 启动失败: {e}", flush=True)
+        os._exit(1)
+
+    # HMAC 密钥对
+    if config.AUTH_ENABLED:
+        _auth_secret, _auth_token = generate_keypair()
+        # 以固定前缀输出，供 Electron 主进程捕获。
+        # 注意：secret 永远不出现在 stdout/stderr/log 中。
+        print(f"ARXIV_AGENT_AUTH_TOKEN={_auth_token.hex()}", flush=True)
+
+    # Signal handler（优雅关闭）
+    _install_signal_handlers()
+
+    # atexit：正常退出时清理 PID 文件
+    atexit.register(_remove_pidfile)
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    """服务关闭时清理 PID 文件。"""
+    _remove_pidfile()
+
+
 # ===================== 入口 =====================
 if __name__ == "__main__":
     import uvicorn
+
     host = os.environ.get("ARXIV_AGENT_HOST", "127.0.0.1")
     port = int(os.environ.get("ARXIV_AGENT_PORT", "7860"))
     uvicorn.run(app, host=host, port=port)

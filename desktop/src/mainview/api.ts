@@ -7,6 +7,96 @@
 
 export const API_BASE_URL = "http://127.0.0.1:7860";
 
+// ===================== HMAC 认证 =====================
+
+/** 是否存在 Electron auth IPC bridge（有 bridge 说明需要签名）。 */
+function hasAuthBridge(): boolean {
+  return Boolean(
+    typeof window !== "undefined" &&
+      (window as unknown as { arxivAgentDesktop?: { auth?: object } })
+        .arxivAgentDesktop?.auth,
+  );
+}
+
+/** 缓存的后端 HMAC token（secret 不离开主进程，只用 token 做标识）。 */
+let cachedAuthToken: string | null = null;
+
+/** 通过 IPC 获取后端 HMAC token（结果缓存到进程生命周期）。 */
+async function getAuthToken(): Promise<string | null> {
+  if (!hasAuthBridge()) return null;
+  if (cachedAuthToken !== null) return cachedAuthToken;
+  try {
+    const bridge = (window as unknown as { arxivAgentDesktop?: { auth?: { getToken: () => Promise<string | null> } } })
+      .arxivAgentDesktop?.auth;
+    if (!bridge) return null;
+    cachedAuthToken = await bridge.getToken();
+    return cachedAuthToken;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 计算请求的 HMAC-SHA256 签名。
+ *
+ * 注意：前端只有 token（公开标识），真正的 secret 始终留在 Python 后端内存中。
+ * 此处签名使用的 "secret" 即为 token 本身 —— 安全性来自后端对 token 的绑定验证，
+ * 即后端启动时生成的 (secret, token) 对中，secret 只在后端内存中。
+ *
+ * 签名格式：HMAC-SHA256(token, "{timestamp}\n{METHOD}\n{path}")
+ */
+async function computeHmacSignature(
+  token: string,
+  timestamp: number,
+  method: string,
+  reqPath: string,
+): Promise<string> {
+  const message = `${timestamp}\n${method}\n${reqPath}`;
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(token);
+  const msgData = encoder.encode(message);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw",
+    keyData,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+  // 转为 hex 字符串
+  return Array.from(new Uint8Array(signature))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * 为 fetch 请求构造带 HMAC 签名的 Authorization 头。
+ * 若无 auth bridge（纯浏览器 dev 模式），返回空 headers。
+ */
+async function buildAuthHeaders(
+  method: string,
+  url: string,
+): Promise<Record<string, string>> {
+  const token = await getAuthToken();
+  if (!token) return {};
+
+  const ts = Math.floor(Date.now() / 1000);
+  // 从完整 URL 提取 path（含 query string）
+  const urlObj = new URL(url);
+  const pathWithQuery = urlObj.pathname + urlObj.search;
+
+  const sig = await computeHmacSignature(token, ts, method, pathWithQuery);
+  return {
+    Authorization: `Hmac ${token}:${ts}:${sig}`,
+  };
+}
+
+/** 重置缓存的 token（后端重启时调用）。 */
+export function resetAuthToken(): void {
+  cachedAuthToken = null;
+}
+
 // ===================== 论文 =====================
 
 export type Paper = {
@@ -116,7 +206,8 @@ export type ErrorCode =
   | "cancelled"
   | "thread_busy"
   | "validation"
-  | "internal";
+  | "internal"
+  | "unauthorized";
 
 export type ErrorResponse = {
   ok: false;
@@ -199,15 +290,19 @@ export async function jsonOrError<T>(res: Response): Promise<T> {
 }
 
 export async function listThreads(): Promise<ThreadMeta[]> {
-  const res = await fetch(`${API_BASE_URL}/api/threads`);
+  const url = `${API_BASE_URL}/api/threads`;
+  const headers = await buildAuthHeaders("GET", url);
+  const res = await fetch(url, { headers });
   const data = await jsonOrError<{ threads: ThreadMeta[] }>(res);
   return data.threads;
 }
 
 export async function createThread(title?: string): Promise<ThreadMeta> {
-  const res = await fetch(`${API_BASE_URL}/api/threads`, {
+  const url = `${API_BASE_URL}/api/threads`;
+  const headers = await buildAuthHeaders("POST", url);
+  const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify({ title: title ?? null }),
   });
   const data = await jsonOrError<{ thread: ThreadMeta }>(res);
@@ -215,14 +310,18 @@ export async function createThread(title?: string): Promise<ThreadMeta> {
 }
 
 export async function getThread(id: string): Promise<ThreadDetail> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${id}`);
+  const url = `${API_BASE_URL}/api/threads/${id}`;
+  const headers = await buildAuthHeaders("GET", url);
+  const res = await fetch(url, { headers });
   return jsonOrError<ThreadDetail>(res);
 }
 
 export async function renameThread(id: string, title: string): Promise<ThreadMeta> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${id}`, {
+  const url = `${API_BASE_URL}/api/threads/${id}`;
+  const headers = await buildAuthHeaders("PATCH", url);
+  const res = await fetch(url, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify({ title }),
   });
   return jsonOrError<ThreadMeta>(res);
@@ -233,9 +332,11 @@ export async function updateThreadMessage(
   messageIndex: number,
   content: string,
 ): Promise<ThreadDetail> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${threadId}/messages/${messageIndex}`, {
+  const url = `${API_BASE_URL}/api/threads/${threadId}/messages/${messageIndex}`;
+  const headers = await buildAuthHeaders("PATCH", url);
+  const res = await fetch(url, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify({ content }),
   });
   return jsonOrError<ThreadDetail>(res);
@@ -245,30 +346,38 @@ export async function deleteThreadMessage(
   threadId: string,
   messageIndex: number,
 ): Promise<ThreadDetail> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${threadId}/messages/${messageIndex}`, {
-    method: "DELETE",
-  });
+  const url = `${API_BASE_URL}/api/threads/${threadId}/messages/${messageIndex}`;
+  const headers = await buildAuthHeaders("DELETE", url);
+  const res = await fetch(url, { method: "DELETE", headers });
   return jsonOrError<ThreadDetail>(res);
 }
 
 export async function deleteThread(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${id}`, { method: "DELETE" });
+  const url = `${API_BASE_URL}/api/threads/${id}`;
+  const headers = await buildAuthHeaders("DELETE", url);
+  const res = await fetch(url, { method: "DELETE", headers });
   await jsonOrError(res);
 }
 
 export async function cancelThread(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${id}/cancel`, { method: "POST" });
+  const url = `${API_BASE_URL}/api/threads/${id}/cancel`;
+  const headers = await buildAuthHeaders("POST", url);
+  const res = await fetch(url, { method: "POST", headers });
   await jsonOrError(res);
 }
 
 export async function getThreadPapers(id: string): Promise<Paper[]> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${id}/papers`);
+  const url = `${API_BASE_URL}/api/threads/${id}/papers`;
+  const headers = await buildAuthHeaders("GET", url);
+  const res = await fetch(url, { headers });
   const data = await jsonOrError<{ papers: Paper[] }>(res);
   return data.papers;
 }
 
 export async function getThreadReport(id: string): Promise<string> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${id}/report`);
+  const url = `${API_BASE_URL}/api/threads/${id}/report`;
+  const headers = await buildAuthHeaders("GET", url);
+  const res = await fetch(url, { headers });
   const data = await jsonOrError<{ report: string }>(res);
   return data.report;
 }
@@ -284,15 +393,17 @@ export async function streamThreadMessage(
   onEvent: (env: AgentEventEnvelope) => void,
   signal?: AbortSignal,
 ): Promise<void> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${threadId}/messages`, {
+  const url = `${API_BASE_URL}/api/threads/${threadId}/messages`;
+  const headers = await buildAuthHeaders("POST", url);
+  const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify(body),
     signal,
   });
 
   if (!res.ok) {
-    // 非流式错误（如 no_api_key）直接抛
+    // 非流式错误（如 no_api_key、unauthorized）直接抛
     const data = await res.json().catch(() => null);
     if (data && data.error) {
       const e = data as ErrorResponse;
@@ -339,16 +450,20 @@ export async function exportThread(
   threadId: string,
   type: ExportType,
 ): Promise<{ filename: string; status: string }> {
-  const res = await fetch(`${API_BASE_URL}/api/threads/${threadId}/export`, {
+  const url = `${API_BASE_URL}/api/threads/${threadId}/export`;
+  const headers = await buildAuthHeaders("POST", url);
+  const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify({ type }),
   });
   return jsonOrError<{ filename: string; status: string }>(res);
 }
 
 export async function downloadExport(filename: string): Promise<Blob> {
-  const res = await fetch(`${API_BASE_URL}/api/download?file=${encodeURIComponent(filename)}`);
+  const url = `${API_BASE_URL}/api/download?file=${encodeURIComponent(filename)}`;
+  const headers = await buildAuthHeaders("GET", url);
+  const res = await fetch(url, { headers });
   return res.blob();
 }
 
@@ -357,9 +472,11 @@ export async function downloadExport(filename: string): Promise<Blob> {
 export async function getConfigHealth(
   body: Partial<MessageRequest> & { ping_llm?: boolean },
 ): Promise<ConfigHealth> {
-  const res = await fetch(`${API_BASE_URL}/api/config/health`, {
+  const url = `${API_BASE_URL}/api/config/health`;
+  const headers = await buildAuthHeaders("POST", url);
+  const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...headers, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   return jsonOrError<ConfigHealth>(res);
