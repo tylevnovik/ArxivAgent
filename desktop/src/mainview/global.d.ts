@@ -17,7 +17,15 @@ declare global {
 				retry: () => Promise<{ ok: boolean }>;
 			};
 			auth?: {
-				getToken: () => Promise<string | null>;
+				sign: (method: string, pathWithQuery: string) => Promise<string | null>;
+			};
+			exports?: {
+				save: (filename: string) => Promise<{
+					ok: boolean;
+					cancelled: boolean;
+					path: string | null;
+					error: string | null;
+				}>;
 			};
 			windowControls?: {
 				minimize: () => void;

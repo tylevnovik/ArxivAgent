@@ -9,92 +9,46 @@ export const API_BASE_URL = "http://127.0.0.1:7860";
 
 // ===================== HMAC 认证 =====================
 
-/** 是否存在 Electron auth IPC bridge（有 bridge 说明需要签名）。 */
-function hasAuthBridge(): boolean {
-  return Boolean(
-    typeof window !== "undefined" &&
-      (window as unknown as { arxivAgentDesktop?: { auth?: object } })
-        .arxivAgentDesktop?.auth,
-  );
-}
-
-/** 缓存的后端 HMAC token（secret 不离开主进程，只用 token 做标识）。 */
-let cachedAuthToken: string | null = null;
-
-/** 通过 IPC 获取后端 HMAC token（结果缓存到进程生命周期）。 */
-async function getAuthToken(): Promise<string | null> {
-  if (!hasAuthBridge()) return null;
-  if (cachedAuthToken !== null) return cachedAuthToken;
-  try {
-    const bridge = (window as unknown as { arxivAgentDesktop?: { auth?: { getToken: () => Promise<string | null> } } })
-      .arxivAgentDesktop?.auth;
-    if (!bridge) return null;
-    cachedAuthToken = await bridge.getToken();
-    return cachedAuthToken;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * 计算请求的 HMAC-SHA256 签名。
- *
- * 注意：前端只有 token（公开标识），真正的 secret 始终留在 Python 后端内存中。
- * 此处签名使用的 "secret" 即为 token 本身 —— 安全性来自后端对 token 的绑定验证，
- * 即后端启动时生成的 (secret, token) 对中，secret 只在后端内存中。
- *
- * 签名格式：HMAC-SHA256(token, "{timestamp}\n{METHOD}\n{path}")
- */
-async function computeHmacSignature(
-  token: string,
-  timestamp: number,
-  method: string,
-  reqPath: string,
-): Promise<string> {
-  const message = `${timestamp}\n${method}\n${reqPath}`;
-  const encoder = new TextEncoder();
-  const keyData = encoder.encode(token);
-  const msgData = encoder.encode(message);
-
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw",
-    keyData,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
-  // 转为 hex 字符串
-  return Array.from(new Uint8Array(signature))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-/**
- * 为 fetch 请求构造带 HMAC 签名的 Authorization 头。
- * 若无 auth bridge（纯浏览器 dev 模式），返回空 headers。
+ * 委托签名：渲染进程不持有 secret，把 (method, path+query) 交给 Electron
+ * 主进程计算签名并返回完整 Authorization 头（secret 只留在主进程）。
+ * 纯浏览器开发模式没有 bridge，不签名；后端按自身 AUTH_ENABLED 决定放行。
  */
 async function buildAuthHeaders(
   method: string,
   url: string,
 ): Promise<Record<string, string>> {
-  const token = await getAuthToken();
-  if (!token) return {};
+  const auth = window.arxivAgentDesktop?.auth;
+  if (!auth?.sign) return {};
 
-  const ts = Math.floor(Date.now() / 1000);
-  // 从完整 URL 提取 path（含 query string）
   const urlObj = new URL(url);
   const pathWithQuery = urlObj.pathname + urlObj.search;
-
-  const sig = await computeHmacSignature(token, ts, method, pathWithQuery);
-  return {
-    Authorization: `Hmac ${token}:${ts}:${sig}`,
-  };
+  try {
+    const header = await auth.sign(method.toUpperCase(), pathWithQuery);
+    return header ? { Authorization: header } : {};
+  } catch {
+    return {};
+  }
 }
 
-/** 重置缓存的 token（后端重启时调用）。 */
-export function resetAuthToken(): void {
-  cachedAuthToken = null;
+/**
+ * 轮询直到后端 health 可达（公开端点，无需签名）。
+ * 冷启动时渲染进程可能先于后端就绪，调用方用它做重试等待。
+ */
+export async function waitForBackend(timeoutMs = 30000, intervalMs = 1200): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/health`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      if (res.ok) return true;
+    } catch {
+      // 未就绪，继续重试
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 }
 
 // ===================== 论文 =====================
@@ -464,6 +418,13 @@ export async function downloadExport(filename: string): Promise<Blob> {
   const url = `${API_BASE_URL}/api/download?file=${encodeURIComponent(filename)}`;
   const headers = await buildAuthHeaders("GET", url);
   const res = await fetch(url, { headers });
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    if (data && typeof data === "object" && "error" in data && (data as ErrorResponse).error) {
+      throw new Error((data as ErrorResponse).error.message);
+    }
+    throw new Error(`下载失败 (HTTP ${res.status})`);
+  }
   return res.blob();
 }
 

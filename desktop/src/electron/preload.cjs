@@ -5,6 +5,7 @@ const { contextBridge, ipcRenderer } = require("electron");
  *
  * secrets: API Key 走主进程的 safeStorage（系统加密存储）。
  * backend: 后端启动诊断与重试（打包版环境向导用）。
+ * auth: HMAC 委托签名（secret 留在主进程，见 main.cjs）。
  *
  * 主进程 handler 见 main.cjs。
  */
@@ -26,7 +27,10 @@ contextBridge.exposeInMainWorld("arxivAgentDesktop", {
 		retry: () => ipcRenderer.invoke("backend:retry"),
 	},
 	auth: {
-		getToken: () => ipcRenderer.invoke("auth:getToken"),
+		sign: (method, pathWithQuery) => ipcRenderer.invoke("auth:sign", method, pathWithQuery),
+	},
+	exports: {
+		save: (filename) => ipcRenderer.invoke("exports:save", filename),
 	},
 	windowControls: {
 		minimize: () => ipcRenderer.send("window:minimize"),

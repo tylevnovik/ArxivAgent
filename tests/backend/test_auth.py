@@ -8,6 +8,7 @@ HMAC 认证模块测试。
 - FastAPI 中间件对受保护/公开路径的处理
 """
 
+import os
 import time
 
 import pytest
@@ -229,3 +230,44 @@ class TestAuthMiddleware:
         data = r.json()
         assert data["auth_enabled"] is True
         assert data["auth_scheme"] == "HMAC-SHA256"
+
+    def test_signature_covers_query_string(self, auth_client):
+        """签名必须覆盖 path+query：只签 path 对带查询串的请求应失败。"""
+        c, secret, token = auth_client
+        # 只签 path（不含 query）→ 验签失败
+        headers = {"Authorization": self._make_header(
+            secret, token, "GET", "/api/download",
+        )}
+        r = c.get("/api/download?file=x.md", headers=headers)
+        assert r.status_code == 401
+        # 签 path+query → 认证通过（文件不存在，落到业务 404）
+        headers = {"Authorization": self._make_header(
+            secret, token, "GET", "/api/download?file=x.md",
+        )}
+        r = c.get("/api/download?file=x.md", headers=headers)
+        assert r.status_code == 404
+
+    def test_download_requires_auth(self, auth_client):
+        c, _, _ = auth_client
+        r = c.get("/api/download?file=x.md")
+        assert r.status_code == 401
+
+    def test_download_rejects_traversal(self, auth_client):
+        c, secret, token = auth_client
+        for bad in ["../secrets.json", "..%2Fsecrets.json", "a/b.md", "a\\b.md"]:
+            path = f"/api/download?file={bad}"
+            headers = {"Authorization": self._make_header(secret, token, "GET", path)}
+            r = c.get(path, headers=headers)
+            assert r.status_code in (400, 404, 422), f"{bad} → {r.status_code}"
+
+    def test_download_serves_export_file(self, auth_client, isolated_data_dir):
+        import config as cfg
+        c, secret, token = auth_client
+        fpath = os.path.join(cfg.EXPORT_DIR, "test_export.md")
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write("hello export")
+        path = "/api/download?file=test_export.md"
+        headers = {"Authorization": self._make_header(secret, token, "GET", path)}
+        r = c.get(path, headers=headers)
+        assert r.status_code == 200
+        assert r.text == "hello export"

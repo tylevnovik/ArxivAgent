@@ -96,6 +96,7 @@ import {
   renameThread,
   streamThreadMessage,
   updateThreadMessage,
+  waitForBackend,
 } from "./api";
 import { applyEvent, withUserMessage } from "./eventReducer";
 import { clearApiKey, hasSecretsBridge, loadApiKey, loadSecret, saveApiKey, saveSecret } from "./secrets";
@@ -201,10 +202,21 @@ function App() {
   const [systemHealth, setSystemHealth] = useState<ConfigHealth | null>(null);
 
   // 拉取一次系统健康（后端版本/Key 状态/数据目录），供第一屏状态条展示。
+  // 冷启动时后端可能还没就绪，先轮询 health 再请求，避免状态条永久卡在"未连接"。
   useEffect(() => {
-    getConfigHealth({ ping_llm: false })
-      .then((h) => setSystemHealth(h))
-      .catch((err) => console.warn("拉取系统健康失败", err));
+    let cancelled = false;
+    (async () => {
+      const ready = await waitForBackend();
+      if (cancelled || !ready) return;
+      getConfigHealth({ ping_llm: false })
+        .then((h) => {
+          if (!cancelled) setSystemHealth(h);
+        })
+        .catch((err) => console.warn("拉取系统健康失败", err));
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // 启动时诊断后端：仅在 Electron 真实环境（有 backend bridge）检查；
@@ -315,13 +327,25 @@ function App() {
     }
   }, []);
 
-  // 初始化：加载列表；首次为空则建一个空线程
+  // 初始化：等后端就绪后加载列表；首次为空则建一个空线程。
+  // 冷启动时渲染进程可能先于后端起来，一次性请求失败会永久卡死界面，所以先轮询。
   useEffect(() => {
+    let cancelled = false;
     (async () => {
+      setStatusText("正在连接本地后端...");
+      const ready = await waitForBackend();
+      if (cancelled) return;
+      if (!ready) {
+        setStatusText("后端未连接");
+        notify("无法连接后端，请检查本地服务是否启动", "error");
+        return;
+      }
       try {
         const list = await listThreads();
+        if (cancelled) return;
         if (list.length === 0) {
           const t = await createThread();
+          if (cancelled) return;
           setThreads([t]);
           await selectThread(t.id);
         } else {
@@ -330,9 +354,12 @@ function App() {
         }
       } catch (err) {
         console.warn("初始化线程失败", err);
-        notify("无法连接后端，请确认本地服务已启动", "error");
+        if (!cancelled) notify("初始化会话失败，请检查后端服务", "error");
       }
     })();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -554,6 +581,21 @@ function App() {
       setStatusText(`正在导出 ${type.toUpperCase()}...`);
       try {
         const result = await exportThread(activeThread.id, type);
+        const saveExport = window.arxivAgentDesktop?.exports?.save;
+        if (saveExport) {
+          // 桌面端：主进程直接复制导出文件 + 原生另存为对话框。
+          // 渲染进程的 <a download> 在 Electron 中不可靠（文件可能不落盘）。
+          const saved = await saveExport(result.filename);
+          if (saved.cancelled) {
+            setStatusText("已取消保存");
+            return;
+          }
+          if (!saved.ok) throw new Error(saved.error || "保存导出文件失败");
+          setStatusText(`已保存: ${saved.path}`);
+          notify(`${name}已导出`, "success");
+          return;
+        }
+        // 浏览器开发模式：blob + anchor 下载回退
         const blob = await downloadExport(result.filename);
         const dlUrl = window.URL.createObjectURL(blob);
         const a = document.createElement("a");

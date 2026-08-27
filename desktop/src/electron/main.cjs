@@ -1,5 +1,6 @@
-const { app, BrowserWindow, shell, ipcMain, safeStorage } = require("electron");
+const { app, BrowserWindow, shell, ipcMain, safeStorage, dialog } = require("electron");
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { fileURLToPath, pathToFileURL } = require("node:url");
@@ -21,10 +22,40 @@ const isSmokeTest = process.argv.includes("--smoke-test");
 const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 3000;
 const FORCE_KILL_WAIT_MS = 2000;
 
-// ===================== HMAC 认证 Token =====================
-// Python 后端启动时通过 stdout 输出 ARXIV_AGENT_AUTH_TOKEN=<hex>，
-// Electron 主进程捕获后存于此，通过 IPC 传给渲染进程。
+// ===================== HMAC 认证（委托签名） =====================
+// Python 后端启动时通过 stdout 输出 ARXIV_AGENT_AUTH_TOKEN=<hex> 与
+// ARXIV_AGENT_AUTH_SECRET=<hex>，Electron 主进程捕获两者。
+// secret 只留在主进程：渲染进程通过 auth:sign IPC 请求签名，
+// 永远拿不到 secret（见 core/auth.py 的密钥设计）。
 let currentAuthToken = null;
+let currentAuthSecret = null;
+
+/**
+ * 用当前 secret 为一个请求计算 HMAC 签名并返回完整 Authorization 头。
+ * 凭证缺失或参数非法时返回 null。
+ */
+function signAuthRequest(method, pathWithQuery) {
+	if (!currentAuthToken || !currentAuthSecret) return null;
+	if (typeof method !== "string" || typeof pathWithQuery !== "string") return null;
+	const ts = Math.floor(Date.now() / 1000);
+	const signature = crypto
+		.createHmac("sha256", Buffer.from(currentAuthSecret, "hex"))
+		.update(`${ts}\n${method.toUpperCase()}\n${pathWithQuery}`, "utf8")
+		.digest("hex");
+	return `Hmac ${currentAuthToken}:${ts}:${signature}`;
+}
+
+/** 解析后端 stdout 的一行，捕获 token / secret 凭证。 */
+function captureAuthCredentialLine(line) {
+	const trimmed = (line || "").trim();
+	if (trimmed.startsWith("ARXIV_AGENT_AUTH_TOKEN=")) {
+		currentAuthToken = trimmed.slice("ARXIV_AGENT_AUTH_TOKEN=".length);
+		console.log("[Electron Main] Captured HMAC auth token from backend.");
+	} else if (trimmed.startsWith("ARXIV_AGENT_AUTH_SECRET=")) {
+		currentAuthSecret = trimmed.slice("ARXIV_AGENT_AUTH_SECRET=".length);
+		console.log("[Electron Main] Captured HMAC auth secret from backend.");
+	}
+}
 
 function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -141,9 +172,47 @@ function registerBackendHandlers() {
 }
 
 function registerAuthHandlers() {
-	// 返回当前后端的 HMAC token（供渲染进程签名请求用）。
-	ipcMain.handle("auth:getToken", () => {
-		return currentAuthToken;
+	// 委托签名：渲染进程提交 (method, path+query)，主进程用 secret 计算
+	// 完整 Authorization 头。secret 不进渲染进程。
+	ipcMain.handle("auth:sign", (_event, method, pathWithQuery) => {
+		return signAuthRequest(method, pathWithQuery);
+	});
+}
+
+function registerExportHandlers() {
+	// 保存导出文件：后端把导出内容写在 backend-data/exports/ 下，
+	// 主进程直接复制到用户选择的位置（原生另存为）。
+	// 不走渲染进程 <a download> —— Electron 里它不可靠（文件可能不落盘）。
+	ipcMain.handle("exports:save", async (_event, filename) => {
+		if (typeof filename !== "string" || !filename
+			|| filename !== path.basename(filename) || filename.includes("..")) {
+			return { ok: false, cancelled: false, path: null, error: "非法文件名" };
+		}
+		const src = path.join(backendDataDirPath(), "exports", filename);
+		if (!fs.existsSync(src)) {
+			return { ok: false, cancelled: false, path: null, error: `导出文件不存在: ${filename}` };
+		}
+
+		let target;
+		if (process.env.ARXIV_AGENT_E2E === "1" && process.env.ARXIV_AGENT_E2E_EXPORT_DIR) {
+			target = path.join(process.env.ARXIV_AGENT_E2E_EXPORT_DIR, filename);
+		} else {
+			const result = await dialog.showSaveDialog(mainWindow, {
+				title: "保存导出文件",
+				defaultPath: path.join(app.getPath("downloads"), filename),
+			});
+			if (result.canceled || !result.filePath) {
+				return { ok: false, cancelled: true, path: null, error: null };
+			}
+			target = result.filePath;
+		}
+
+		try {
+			fs.copyFileSync(src, target);
+			return { ok: true, cancelled: false, path: target, error: null };
+		} catch (err) {
+			return { ok: false, cancelled: false, path: null, error: `保存失败: ${err.message}` };
+		}
 	});
 }
 
@@ -167,8 +236,12 @@ function registerWindowHandlers() {
 
 // ===================== PID 文件 & 进程清理 =====================
 
+function backendDataDirPath() {
+	return path.join(app.getPath("userData"), "backend-data");
+}
+
 function pidFilePath() {
-	return path.join(app.getPath("userData"), "backend-data", "backend.pid");
+	return path.join(backendDataDirPath(), "backend.pid");
 }
 
 /**
@@ -523,7 +596,7 @@ async function startPythonBackend() {
 	const pythonInfo = findPythonPath(backendRoot);
 	const pythonPath = pythonInfo.path;
 	const appPyPath = path.join(backendRoot, "app.py");
-	const backendDataDir = path.join(app.getPath("userData"), "backend-data");
+	const backendDataDir = backendDataDirPath();
 	fs.mkdirSync(backendDataDir, { recursive: true });
 	const pidFile = path.join(backendDataDir, "backend.pid");
 	console.log(`[Electron Main] Spawning Python process: ${pythonPath} ${appPyPath}`);
@@ -551,30 +624,24 @@ async function startPythonBackend() {
 			windowsHide: true,
 		});
 
-		// 从 Python 后端 stdout 捕获 auth token。
-		// Python 启动时会输出 "ARXIV_AGENT_AUTH_TOKEN=<hex>"，我们解析后存入 currentAuthToken。
+		// 从 Python 后端 stdout 捕获 auth 凭证（token + secret）。
+		// Python 启动时输出 "ARXIV_AGENT_AUTH_TOKEN=<hex>" 与
+		// "ARXIV_AGENT_AUTH_SECRET=<hex>"，逐行解析后存入主进程状态。
 		let stdoutBuffer = "";
 		if (pythonProc.stdout) {
 			pythonProc.stdout.on("data", (chunk) => {
 				const text = chunk.toString("utf-8");
 				stdoutBuffer += text;
-				// 逐行扫描 token 标记
+				// 逐行扫描凭证标记
 				const lines = stdoutBuffer.split("\n");
 				stdoutBuffer = lines.pop() || "";
 				for (const line of lines) {
-					const trimmed = line.trim();
-					if (trimmed.startsWith("ARXIV_AGENT_AUTH_TOKEN=")) {
-						currentAuthToken = trimmed.slice("ARXIV_AGENT_AUTH_TOKEN=".length);
-						console.log("[Electron Main] Captured HMAC auth token from backend.");
-					}
+					captureAuthCredentialLine(line);
 				}
 			});
 			pythonProc.stdout.on("end", () => {
 				// 处理最后可能没有换行的残余
-				if (stdoutBuffer.trim().startsWith("ARXIV_AGENT_AUTH_TOKEN=")) {
-					currentAuthToken = stdoutBuffer.trim().slice("ARXIV_AGENT_AUTH_TOKEN=".length);
-					console.log("[Electron Main] Captured HMAC auth token from backend (flush).");
-				}
+				captureAuthCredentialLine(stdoutBuffer);
 			});
 		}
 
@@ -592,6 +659,7 @@ async function startPythonBackend() {
 			exitInfo = { code, signal };
 			pythonProc = null;
 			currentAuthToken = null;
+			currentAuthSecret = null;
 		});
 	} catch (err) {
 		console.error("[Electron Main] Failed to spawn Python backend:", err);
@@ -776,6 +844,7 @@ async function stopPythonBackend() {
 
 	pythonProc = null;
 	currentAuthToken = null;
+	currentAuthSecret = null;
 	removePidFile();
 }
 
@@ -796,6 +865,38 @@ app.on("activate", () => {
 	}
 });
 
+/**
+ * 冒烟测试专用：用捕获的凭证真实签名一次受保护端点请求，
+ * 验证整条认证链（凭证捕获 → 主进程签名 → 后端验签）。
+ * health 是公开端点，只查它无法暴露认证链断裂。
+ */
+async function smokeCheckAuth() {
+	// stdout 凭证解析与 health 就绪可能竞争：等待凭证到达（最多 3s）
+	const deadline = Date.now() + 3000;
+	while (Date.now() < deadline && (!currentAuthToken || !currentAuthSecret)) {
+		await sleep(100);
+	}
+	const authorization = signAuthRequest("GET", "/api/threads");
+	if (!authorization) {
+		console.error("[Electron Main] Smoke auth check failed: auth credentials not captured.");
+		return false;
+	}
+	try {
+		const res = await fetch(`${BACKEND_URL}/api/threads`, {
+			headers: { Authorization: authorization },
+		});
+		if (!res.ok) {
+			console.error(`[Electron Main] Smoke auth check failed: HTTP ${res.status}.`);
+			return false;
+		}
+		console.log("[Electron Main] Smoke auth check passed (signed request accepted).");
+		return true;
+	} catch (err) {
+		console.error("[Electron Main] Smoke auth check failed:", err);
+		return false;
+	}
+}
+
 async function bootstrap() {
 	const [backendResult, rendererUrl] = await Promise.all([
 		startPythonBackend(),
@@ -804,15 +905,17 @@ async function bootstrap() {
 
 	if (isSmokeTest) {
 		const rendererReady = await isRendererAvailable(rendererUrl);
+		const authOk = backendResult.ok ? await smokeCheckAuth() : false;
 		console.log(JSON.stringify({
 			backendReady: backendResult.ok,
 			backendError: backendResult.error || null,
+			authOk,
 			rendererReady,
 			rendererUrl,
 			packaged: app.isPackaged,
 		}));
 		stopPythonBackend();
-		app.exit(backendResult.ok && rendererReady ? 0 : 1);
+		app.exit(backendResult.ok && rendererReady && authOk ? 0 : 1);
 		return;
 	}
 
@@ -827,6 +930,7 @@ void app.whenReady().then(() => {
 	registerSecretsHandlers();
 	registerBackendHandlers();
 	registerAuthHandlers();
+	registerExportHandlers();
 	registerWindowHandlers();
 	return bootstrap();
 });

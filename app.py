@@ -14,7 +14,7 @@ from typing import Optional
 import requests
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from openai import OpenAI
 
 from core.agent import ArxivAgent, EventType, AgentEvent
@@ -186,10 +186,15 @@ async def auth_middleware(request: Request, call_next):
     if is_public_path(path):
         return await call_next(request)
 
+    # 签名覆盖 path+query（与前端 pathname+search 一致），
+    # 否则 /api/download?file= 这类带查询串的端点永远验签失败。
+    query = request.url.query
+    signed_path = f"{path}?{query}" if query else path
+
     authorization = request.headers.get("authorization")
     method = request.method.upper()
     try:
-        verify_request(_auth_secret, _auth_token, authorization, method, path)
+        verify_request(_auth_secret, _auth_token, authorization, method, signed_path)
     except AuthError as e:
         return unauthorized_response(str(e))
 
@@ -814,6 +819,21 @@ def api_thread_export(thread_id: str, body: ExportRequest):
 
 # ===================== 下载 =====================
 
+@app.get("/api/download")
+def api_download(file: str):
+    """下载 exports 目录中的导出文件。只接受该目录内的普通文件名。"""
+    # 路径穿越防护：拒绝分隔符、".."，且必须等于自身 basename。
+    if not file or "/" in file or "\\" in file or ".." in file or file != os.path.basename(file):
+        return _error_json(ErrorCode.VALIDATION, "非法文件名", recoverable=False, status_code=400)
+
+    export_root = os.path.realpath(config.EXPORT_DIR)
+    filepath = os.path.realpath(os.path.join(export_root, file))
+    if os.path.dirname(filepath) != export_root or not os.path.isfile(filepath):
+        return _error_json(ErrorCode.NOT_FOUND, f"文件 {file} 不存在",
+                           recoverable=False, status_code=404)
+
+    return FileResponse(filepath, filename=file, media_type="application/octet-stream")
+
 
 # ===================== 认证状态端点 =====================
 
@@ -862,8 +882,10 @@ def on_startup():
     if config.AUTH_ENABLED:
         _auth_secret, _auth_token = generate_keypair()
         # 以固定前缀输出，供 Electron 主进程捕获。
-        # 注意：secret 永远不出现在 stdout/stderr/log 中。
+        # secret 通过 stdout 管道只交给父进程（Electron 主进程）做委托签名，
+        # 不写入任何日志，也不传给渲染进程。
         print(f"ARXIV_AGENT_AUTH_TOKEN={_auth_token.hex()}", flush=True)
+        print(f"ARXIV_AGENT_AUTH_SECRET={_auth_secret.hex()}", flush=True)
 
     # Signal handler（优雅关闭）
     _install_signal_handlers()
