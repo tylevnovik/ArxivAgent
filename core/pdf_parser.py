@@ -90,16 +90,46 @@ def extract_text_from_pdf(pdf_path: str) -> str:
 
 
 def chunk_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> list[str]:
-    """将文本切分为固定大小的分块，并带有一定重叠"""
+    """按段落边界贪心切分：尽量不切断段落，并用块尾段落带入下一块实现重叠。"""
     if not text:
         return []
-    
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - chunk_overlap
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paragraphs:
+        return []
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    for para in paragraphs:
+        # 单段落超过预算：先落盘现有块，再对超长段落硬切
+        if len(para) > chunk_size:
+            if current:
+                chunks.append("\n\n".join(current))
+                current, current_len = [], 0
+            step = max(1, chunk_size - chunk_overlap)
+            for start in range(0, len(para), step):
+                chunks.append(para[start:start + chunk_size])
+            continue
+
+        if current and current_len + len(para) + 2 > chunk_size:
+            chunks.append("\n\n".join(current))
+            # 重叠：把上一块尾部段落带入下一块（总长不超过 overlap 预算）
+            overlap_paras: list[str] = []
+            overlap_len = 0
+            for prev in reversed(current):
+                if overlap_len + len(prev) > chunk_overlap:
+                    break
+                overlap_paras.insert(0, prev)
+                overlap_len += len(prev)
+            current, current_len = overlap_paras, overlap_len
+
+        current.append(para)
+        current_len += len(para) + 2
+
+    if current:
+        chunks.append("\n\n".join(current))
     return chunks
 
 

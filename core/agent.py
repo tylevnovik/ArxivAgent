@@ -3,10 +3,14 @@ Agent 主循环逻辑
 实现：理解需求 → 构造检索式 → 执行检索 → 审核结果 → 决策是否迭代
 支持：多轮对话、检索错误智能恢复
 """
+import hashlib
 import json
 import re
 import sys
+import threading
 import traceback
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
@@ -141,6 +145,71 @@ def _select_relevant_papers(reviewed_papers, papers: list[dict]) -> list[dict]:
     return selected
 
 
+# ===================== 进程级检索器缓存 =====================
+# 同一线程的每条消息都会新建 ArxivAgent；缓存检索器避免追问时重复嵌入。
+# key = chunks 内容指纹；条目为 (retriever, summary)。
+_RETRIEVER_CACHE: "OrderedDict[str, tuple]" = OrderedDict()
+_RETRIEVER_CACHE_MAX = 4
+_RETRIEVER_CACHE_LOCK = threading.Lock()
+
+
+def _retriever_cache_key(chunks: list[dict]) -> str:
+    digest = hashlib.sha1()
+    for chunk in chunks:
+        raw = "|".join([
+            str(chunk.get("arxiv_id", "")),
+            str(chunk.get("paper_title", "")),
+            str(chunk.get("chunk_index", "")),
+            str(chunk.get("text", ""))[:500],
+        ])
+        digest.update((raw + "\n").encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def _retriever_cache_get(key: str):
+    with _RETRIEVER_CACHE_LOCK:
+        entry = _RETRIEVER_CACHE.get(key)
+        if entry is None:
+            return None
+        _RETRIEVER_CACHE.move_to_end(key)
+        return entry
+
+
+def _retriever_cache_put(key: str, entry) -> None:
+    with _RETRIEVER_CACHE_LOCK:
+        _RETRIEVER_CACHE[key] = entry
+        _RETRIEVER_CACHE.move_to_end(key)
+        while len(_RETRIEVER_CACHE) > _RETRIEVER_CACHE_MAX:
+            _RETRIEVER_CACHE.popitem(last=False)
+
+
+def _cached_collection_names() -> set[str]:
+    """缓存中所有 HybridRetriever 的 Qdrant collection 名（清理时要保留）。"""
+    names: set[str] = set()
+    with _RETRIEVER_CACHE_LOCK:
+        entries = list(_RETRIEVER_CACHE.values())
+    for retriever, _ in entries:
+        dense = getattr(retriever, "dense_retriever", None)
+        name = getattr(dense, "collection_name", "") if dense else ""
+        if name:
+            names.add(name)
+    return names
+
+
+def _extract_query_variants(result: dict) -> list[str]:
+    """从 LLM 的解析/优化结果里提取英文检索变体（keywords + arxiv_query），供 RAG 多查询。"""
+    variants: list[str] = []
+    keywords = result.get("keywords")
+    if isinstance(keywords, list) and keywords:
+        joined = " ".join(str(k).strip() for k in keywords if str(k).strip())
+        if joined:
+            variants.append(joined)
+    arxiv_query = str(result.get("arxiv_query") or "").strip()
+    if arxiv_query:
+        variants.append(arxiv_query)
+    return variants
+
+
 
 class ArxivAgent:
     """ArXiv 论文检索 Agent（支持多轮对话）"""
@@ -169,6 +238,8 @@ class ArxivAgent:
         )
         # 取消令牌：被 set 后，下一次 LLM token / 检索边界会抛 CancelledError
         self.cancel_event = cancel_event if cancel_event is not None else threading.Event()
+        # 本轮检索的英文查询变体（供报告/追问的 RAG 多查询检索）
+        self._rag_query_variants: list[str] = []
 
     def update_config(self, api_key: str = None, base_url: str = None, model: str = None,
                       max_search_rounds: int = None, max_results_per_round: int = None,
@@ -198,6 +269,7 @@ class ArxivAgent:
         """完全重置 Agent 状态"""
         self.memory.reset()
         self._has_searched = False
+        self._rag_query_variants = []
 
     def _stream_chat(self, messages: list):
         """代理流式对话调用，支持动态参数；透传取消令牌。"""
@@ -335,7 +407,15 @@ class ArxivAgent:
                          content=f"💡 {analysis}")
 
         if not needs_search:
-            # 不需要检索（讨论结果或闲聊）
+            # 讨论结果时尽量用全文 RAG 生成有正文依据的回答：
+            # 每条消息都是新 agent（retriever 不跨消息），先按需重建索引。
+            if intent == "discuss_results" and self.memory.final_papers:
+                yield from self._ensure_retriever()
+                if getattr(self, "retriever", None) is not None:
+                    yield from self._stream_followup_reply(user_message)
+                    return
+
+            # 索引不可用（无正文/重建失败）或一般对话：用意图步骤的内联回复
             response_text = intent_result.get("response", "")
             if response_text:
                 self.memory.add_conversation("assistant", response_text)
@@ -394,6 +474,10 @@ class ArxivAgent:
                 min_value=1,
                 max_value=self.max_results_per_round,
             )
+
+            # RAG 多查询变体：LLM 产出的英文 keywords / arxiv_query 对正文检索更友好
+            self._rag_query_variants = _extract_query_variants(query_result)
+            self.memory.rag_query_variants = list(self._rag_query_variants)
 
             # ===== 迭代检索循环 =====
             for round_num in range(1, self.max_search_rounds + 1):
@@ -488,6 +572,10 @@ class ArxivAgent:
                         min_value=1,
                         max_value=self.max_results_per_round,
                     )
+                    refined_variants = _extract_query_variants(refine_result)
+                    if refined_variants:
+                        self._rag_query_variants = refined_variants
+                        self.memory.rag_query_variants = list(refined_variants)
 
                     yield AgentEvent(EventType.REFINE, round_num=round_num,
                                      step_name="策略已优化",
@@ -500,27 +588,26 @@ class ArxivAgent:
             # ===== 生成最终报告 =====
             final_papers = self.memory.get_all_relevant_papers()
 
-            # --- 启动 PDF 下载与 RAG 建库 ---
+            # --- 启动 PDF 下载与 RAG 建库（并行 + 进度事件） ---
             if final_papers:
                 yield AgentEvent(EventType.STEP_START, step_name="解析正文",
                                  content=f"📥 正在获取并解析 {len(final_papers)} 篇论文的正文进行 RAG 分析...")
-                all_chunks = []
-                from core import pdf_parser
-                for p in final_papers:
-                    self._check_cancelled()
-                    pdf_link = p.get("pdf_link", "")
-                    title = p.get("title", "无标题")
-                    if pdf_link:
-                        chunks = pdf_parser.process_paper_pdf(title, pdf_link)
-                        all_chunks.extend(chunks)
-                
+                all_chunks = yield from self._collect_paper_chunks(final_papers)
+
                 if all_chunks:
-                    self.retriever, retriever_summary = self._build_rag_retriever(all_chunks)
-                    yield AgentEvent(EventType.STEP_START, step_name="解析正文",
-                                     content=(
-                                         f"📝 正文解析完成，共构建 {len(all_chunks)} 个文本分块的本地 RAG 索引。\n"
-                                         f"检索器: {retriever_summary}"
-                                     ))
+                    try:
+                        self.retriever, retriever_summary = self._build_rag_retriever(all_chunks)
+                    except Exception as e:  # noqa: BLE001 - 建库失败降级为摘要报告
+                        _safe_log(f"[WARN] RAG retriever build failed: {e}")
+                        self.retriever = None
+                        yield AgentEvent(EventType.STEP_START, step_name="解析正文",
+                                         content="⚠️ 正文索引构建失败，将降级为仅依据摘要生成报告。")
+                    else:
+                        yield AgentEvent(EventType.STEP_START, step_name="解析正文",
+                                         content=(
+                                             f"📝 正文解析完成，共构建 {len(all_chunks)} 个文本分块的本地 RAG 索引。\n"
+                                             f"检索器: {retriever_summary}"
+                                         ))
                 else:
                     self.retriever = None
                     yield AgentEvent(EventType.STEP_START, step_name="解析正文",
@@ -652,9 +739,104 @@ class ArxivAgent:
 
     # ======================== 各步骤实现 ========================
 
+    def _collect_paper_chunks(self, papers: list[dict]) -> Generator[AgentEvent, None, list[dict]]:
+        """
+        并行下载/解析论文正文并切片，返回合并后的分块列表。
+
+        每篇完成时 yield 一条进度事件（含失败计数）；通过 pdf_parser 模块属性
+        调用以保持测试可替换。取消时每篇完成后在边界检查。
+        """
+        from core import pdf_parser
+
+        all_chunks: list[dict] = []
+        total = len(papers)
+        if total == 0:
+            return all_chunks
+
+        pool = ThreadPoolExecutor(max_workers=config.PDF_PARSE_WORKERS)
+        done = 0
+        failed = 0
+        try:
+            futures = {}
+            for p in papers:
+                pdf_link = p.get("pdf_link", "")
+                title = p.get("title", "无标题")
+                if not pdf_link:
+                    done += 1
+                    failed += 1
+                    continue
+                futures[pool.submit(pdf_parser.process_paper_pdf, title, pdf_link)] = title
+
+            for fut in as_completed(futures):
+                title = futures[fut]
+                try:
+                    chunks = fut.result()
+                except Exception as e:  # noqa: BLE001 - 单篇失败不阻塞整体
+                    chunks = []
+                    _safe_log(f"[WARN] Failed to process paper PDF: {title} - {e}")
+                done += 1
+                if not chunks:
+                    failed += 1
+                all_chunks.extend(chunks)
+                yield AgentEvent(
+                    EventType.STEP_START, step_name="解析正文",
+                    content=f"📥 正文解析进度 {done}/{total} 篇"
+                            + (f"（失败 {failed} 篇）" if failed else ""),
+                )
+                self._check_cancelled()
+        except BaseException:
+            # 取消/异常：不再等待排队中的下载
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+        return all_chunks
+
+    def _ensure_retriever(self) -> Generator[AgentEvent, None, None]:
+        """
+        确保 retriever 可用：每条消息都是新 agent，追问前按需重建正文索引。
+        PDF 有磁盘缓存，重建不再触发网络下载；collection 已存在时也不再重新嵌入。
+        """
+        if getattr(self, "retriever", None) is not None:
+            return
+        papers = self.memory.final_papers or self.memory.get_all_relevant_papers()
+        if not papers:
+            return
+        yield AgentEvent(EventType.STEP_START, step_name="恢复正文索引",
+                         content=f"📥 正在为 {len(papers)} 篇论文恢复正文 RAG 索引（供追问引用正文）...")
+        chunks = yield from self._collect_paper_chunks(papers)
+        if not chunks:
+            self.retriever = None
+            return
+        try:
+            self.retriever, summary = self._build_rag_retriever(chunks)
+        except Exception as e:  # noqa: BLE001 - 重建失败时降级为无正文回答
+            _safe_log(f"[WARN] Retriever rebuild failed: {e}")
+            self.retriever = None
+            yield AgentEvent(EventType.STEP_START, step_name="恢复正文索引",
+                             content="⚠️ 正文索引重建失败，追问回答将仅基于摘要与历史。")
+            return
+        yield AgentEvent(EventType.STEP_START, step_name="恢复正文索引",
+                         content=f"📝 正文 RAG 索引已就绪。检索器: {summary}")
+
+    def _rag_queries_for(self, primary: str) -> list[str]:
+        """主查询 + 已记录的检索变体（去重，限制总数控制检索成本）。"""
+        queries = [primary]
+        variants = self._rag_query_variants or self.memory.rag_query_variants
+        for variant in variants or []:
+            v = (variant or "").strip()
+            if v and v not in queries:
+                queries.append(v)
+        return queries[:4]
+
     def _build_rag_retriever(self, chunks: list[dict]):
-        """优先构建混合检索器，依赖不可用时回退到轻量 TF-IDF。"""
+        """优先构建混合检索器，依赖不可用时回退到轻量 TF-IDF。带进程级缓存。"""
         from core.rag import TFIDFRetriever
+
+        cache_key = _retriever_cache_key(chunks)
+        cached = _retriever_cache_get(cache_key)
+        if cached is not None:
+            return cached
 
         retriever_type = getattr(config, "RAG_RETRIEVER_TYPE", "hybrid")
         if retriever_type == "hybrid":
@@ -663,13 +845,34 @@ class ArxivAgent:
 
                 retriever = HybridRetriever()
                 retriever.build_index(chunks)
-                return retriever, retriever.index_summary
+                summary = retriever.index_summary
+                self._prune_stale_qdrant(retriever)
+                entry = (retriever, summary)
+                _retriever_cache_put(cache_key, entry)
+                return entry
             except Exception as e:
                 _safe_log(f"[WARN] Hybrid RAG initialization failed; falling back to TF-IDF: {e}")
 
         retriever = TFIDFRetriever()
         retriever.build_index(chunks)
-        return retriever, f"TFIDFRetriever(fallback, chunks={len(chunks)})"
+        entry = (retriever, f"TFIDFRetriever(fallback, chunks={len(chunks)})")
+        _retriever_cache_put(cache_key, entry)
+        return entry
+
+    def _prune_stale_qdrant(self, retriever) -> None:
+        """尽力清理同前缀的过期 Qdrant collection：保留当前与缓存中的，其余删除。"""
+        try:
+            from core.rag import _prune_stale_collections
+
+            dense = getattr(retriever, "dense_retriever", None)
+            if dense is None or not getattr(dense, "collection_name", ""):
+                return
+            keep = {dense.collection_name, *_cached_collection_names()}
+            deleted = _prune_stale_collections(dense.client, dense.collection_prefix, keep)
+            if deleted:
+                _safe_log(f"[RAG] Pruned {len(deleted)} stale qdrant collection(s): {deleted}")
+        except Exception as e:  # noqa: BLE001 - 清理失败不影响主流程
+            _safe_log(f"[WARN] Qdrant collection cleanup failed: {e}")
 
     def _step_parse_query(self, user_query: str, round_num: int):
         """理解需求 + 构造检索式"""
@@ -745,11 +948,17 @@ class ArxivAgent:
         """生成最终报告"""
         papers_text = arxiv_search.format_papers_for_llm(final_papers)
 
-        # 检索正文切片 (RAG)
+        # 检索正文切片 (RAG)：原始需求 + 英文检索变体多查询合并，提升召回
         rag_context = ""
         retrieved: list[dict] = []
-        if hasattr(self, "retriever") and self.retriever and self.retriever.chunks:
-            retrieved = self.retriever.retrieve(user_query, top_k=config.RAG_TOP_K)
+        retriever = getattr(self, "retriever", None)
+        if retriever is not None and getattr(retriever, "chunks", None):
+            from core.rag import merge_retrievals
+            queries = self._rag_queries_for(user_query)
+            retrieved = merge_retrievals(
+                [retriever.retrieve(q, top_k=config.RAG_TOP_K) for q in queries],
+                top_k=config.RAG_TOP_K,
+            )
             if retrieved:
                 rag_context = _format_rag_context(retrieved)
         if not rag_context:
@@ -830,10 +1039,16 @@ class ArxivAgent:
         conv_text = self._format_conversation_history()
         papers_text = arxiv_search.format_papers_for_llm(self.memory.get_all_relevant_papers())
 
-        # 检索正文切片 (RAG)
+        # 检索正文切片 (RAG)：追问文本 + 历史检索变体多查询合并
         rag_context = ""
-        if hasattr(self, "retriever") and self.retriever and self.retriever.chunks:
-            retrieved = self.retriever.retrieve(user_message, top_k=config.RAG_TOP_K)
+        retriever = getattr(self, "retriever", None)
+        if retriever is not None and getattr(retriever, "chunks", None):
+            from core.rag import merge_retrievals
+            queries = self._rag_queries_for(user_message)
+            retrieved = merge_retrievals(
+                [retriever.retrieve(q, top_k=config.RAG_TOP_K) for q in queries],
+                top_k=config.RAG_TOP_K,
+            )
             if retrieved:
                 rag_context = _format_rag_context(retrieved)
 

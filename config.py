@@ -66,6 +66,9 @@ os.makedirs(SEARCH_CACHE_DIR, exist_ok=True)
 PDF_CACHE_DIR = os.path.join(DATA_DIR, "pdf_cache")
 os.makedirs(PDF_CACHE_DIR, exist_ok=True)
 
+# PDF 正文解析并发数（下载 + 提文本 + 切片）
+PDF_PARSE_WORKERS = max(1, int(os.environ.get("ARXIV_AGENT_PDF_PARSE_WORKERS", "3")))
+
 # 线程持久化目录（每个线程一个 JSON）
 THREADS_DIR = os.path.join(DATA_DIR, "threads")
 os.makedirs(THREADS_DIR, exist_ok=True)

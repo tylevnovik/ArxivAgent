@@ -57,6 +57,8 @@ class Memory:
         self.final_papers: list[dict] = []  # 最终推荐论文
         self.final_report: str = ""         # 最终报告
         self.evidence_chunks: list[dict] = []  # 报告引用的正文证据切片（RAG 命中）
+        # 检索式变体（LLM 产出的 keywords / arxiv_query），供 RAG 多查询检索复用
+        self.rag_query_variants: list[str] = []
     
     def set_user_query(self, query: str):
         """设置用户原始需求"""
@@ -159,6 +161,7 @@ class Memory:
             "final_papers": self.final_papers,
             "final_report": self.final_report,
             "evidence_chunks": self.evidence_chunks,
+            "rag_query_variants": self.rag_query_variants,
         }
 
     @classmethod
@@ -176,6 +179,9 @@ class Memory:
         mem.final_papers = list(data.get("final_papers", []) or [])
         mem.final_report = str(data.get("final_report", "") or "")
         mem.evidence_chunks = list(data.get("evidence_chunks", []) or [])
+        mem.rag_query_variants = [
+            str(v) for v in (data.get("rag_query_variants") or [])
+        ]
         return mem
 
     def reset(self):

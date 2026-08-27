@@ -7,6 +7,7 @@ import hashlib
 import math
 import os
 import re
+import threading
 import warnings
 from collections import Counter
 from abc import ABC, abstractmethod
@@ -180,6 +181,21 @@ class FastEmbedEmbeddingProvider:
         return _to_float_list(next(self.model.query_embed(query or "")))
 
 
+_EMBEDDING_PROVIDERS: dict[str, FastEmbedEmbeddingProvider] = {}
+_EMBEDDING_PROVIDERS_LOCK = threading.Lock()
+
+
+def _get_embedding_provider(model_name: str | None = None) -> FastEmbedEmbeddingProvider:
+    """进程级复用 embedding 模型，避免每次重建索引都重新加载（首次下载也不竞态）。"""
+    name = model_name or config.RAG_EMBEDDING_MODEL
+    with _EMBEDDING_PROVIDERS_LOCK:
+        provider = _EMBEDDING_PROVIDERS.get(name)
+        if provider is None:
+            provider = FastEmbedEmbeddingProvider(model_name=name)
+            _EMBEDDING_PROVIDERS[name] = provider
+        return provider
+
+
 class BM25SRetriever:
     """BM25S 关键词检索器，和向量检索并行用于混合召回。"""
 
@@ -249,12 +265,17 @@ class QdrantDenseRetriever:
         from qdrant_client import models
 
         self.chunks = chunks
-        self.collection_name = _collection_name(self.collection_prefix, chunks)
+        # collection 名包含模型标识：换模型后同名集合不可复用（向量维度不同）。
+        self.collection_name = _collection_name(
+            self.collection_prefix, chunks, self.embedding_provider.model_name,
+        )
+
+        # 同一 chunk 集合 + 同一模型的 collection 已存在：直接复用，跳过重新嵌入。
+        if _collection_exists(self.client, self.collection_name):
+            return
+
         vectors = self.embedding_provider.embed_documents([c.get("text", "") for c in chunks])
         vector_size = self.embedding_provider.dimension
-
-        if _collection_exists(self.client, self.collection_name):
-            self.client.delete_collection(self.collection_name)
 
         self.client.create_collection(
             collection_name=self.collection_name,
@@ -357,7 +378,7 @@ class HybridRetriever(BaseRetriever):
         if not self.chunks:
             return
 
-        self.embedding_provider = FastEmbedEmbeddingProvider()
+        self.embedding_provider = _get_embedding_provider()
         self.dense_retriever = QdrantDenseRetriever(self.embedding_provider)
         self.dense_retriever.build_index(self.chunks)
 
@@ -490,11 +511,59 @@ def _query_qdrant_points(client, collection_name: str, query_vector: list[float]
     )
 
 
-def _collection_name(prefix: str, chunks: list[dict]) -> str:
+def _collection_name(prefix: str, chunks: list[dict], model_tag: str = "") -> str:
     digest = hashlib.sha1()
+    digest.update((str(model_tag) + "\n").encode("utf-8"))
     for chunk in chunks:
         digest.update((chunk.get("chunk_id", "") + "\n").encode("utf-8"))
     return f"{prefix}_{digest.hexdigest()[:16]}"
+
+
+def _prune_stale_collections(client, prefix: str, keep: set[str]) -> list[str]:
+    """
+    删除同前缀且不在 keep 中的 collection（历次检索的残留，防止磁盘膨胀）。
+
+    全程容错：枚举/删除失败仅跳过。返回实际删除的名单（供调用方记日志）。
+    """
+    deleted: list[str] = []
+    try:
+        names = [c.name for c in client.get_collections().collections]
+    except Exception:
+        return deleted
+    for name in names:
+        if not name.startswith(prefix) or name in keep:
+            continue
+        try:
+            client.delete_collection(name)
+            deleted.append(name)
+        except Exception:
+            continue
+    return deleted
+
+
+def merge_retrievals(results_by_query: list[list[dict]], top_k: int) -> list[dict]:
+    """
+    合并多个查询的检索结果：同一切片只保留得分最高的一次命中。
+
+    去重键优先用 chunk_id（混合检索器产物）；TF-IDF 结果没有 chunk_id，
+    退回 (paper_title, chunk_index)。
+    """
+    best: dict = {}
+    for results in results_by_query:
+        for item in results or []:
+            key = item.get("chunk_id") or (
+                item.get("paper_title", ""), item.get("chunk_index"),
+            )
+            score = float(item.get("score", 0.0) or 0.0)
+            current = best.get(key)
+            if current is None or score > float(current.get("score", 0.0) or 0.0):
+                best[key] = item
+    merged = sorted(
+        best.values(),
+        key=lambda item: float(item.get("score", 0.0) or 0.0),
+        reverse=True,
+    )
+    return merged[: max(0, top_k)]
 
 
 def _normalize_chunk(chunk: dict, idx: int) -> dict:

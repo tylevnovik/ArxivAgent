@@ -44,6 +44,17 @@ def reset_thread_manager():
     thread_manager._tasks.clear()
 
 
+@pytest.fixture(autouse=True)
+def reset_retriever_cache():
+    """清空进程级检索器缓存，避免跨测试污染（缓存是模块级状态）。"""
+    from core import agent as agent_mod
+    with agent_mod._RETRIEVER_CACHE_LOCK:
+        agent_mod._RETRIEVER_CACHE.clear()
+    yield
+    with agent_mod._RETRIEVER_CACHE_LOCK:
+        agent_mod._RETRIEVER_CACHE.clear()
+
+
 # ===================== Mock 数据 =====================
 
 MOCK_PAPER = {
