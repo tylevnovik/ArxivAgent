@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import {
   ThemeProvider,
   createTheme,
@@ -98,10 +98,10 @@ import {
   updateThreadMessage,
   waitForBackend,
 } from "./api";
-import { applyEvent, withUserMessage } from "./eventReducer";
+import { applyEvent, deriveProgress, withUserMessage, type SearchProgress } from "./eventReducer";
 import { clearApiKey, hasSecretsBridge, loadApiKey, loadSecret, saveApiKey, saveSecret } from "./secrets";
 import { renderMarkdown } from "./markdown";
-import { extractCitations, matchEvidence } from "./citations-core";
+import { extractCitations, matchEvidence, type CitationRef } from "./citations-core";
 import { SetupWizard } from "./SetupWizard";
 import { PROVIDER_PRESETS, getPreset } from "./providers";
 
@@ -296,6 +296,7 @@ function App() {
     message: string;
     severity: "success" | "info" | "warning" | "error";
   } | null>(null);
+  const [progress, setProgress] = useState<SearchProgress | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const activeIdRef = useRef<string | null>(null);
 
@@ -468,6 +469,7 @@ function App() {
             // 切换了线程就不再更新
             if (activeIdRef.current !== threadId) return;
             setActiveThread((prev) => (prev ? applyEvent(prev, env) : prev));
+            setProgress((p) => deriveProgress(p, env));
             setStatusText(env.message || STATUS_LABEL.running);
             if (env.type === "searching_done" || env.type === "papers") {
               setActiveTab(0);
@@ -525,6 +527,7 @@ function App() {
       } finally {
         abortRef.current = null;
         setIsSearching(false);
+        setProgress(null);
         if (activeIdRef.current === threadId) {
           try {
             const detail = await getThread(threadId);
@@ -842,6 +845,8 @@ function App() {
                   chatHistory={chatHistory}
                   isSearching={isSearching}
                   statusText={statusText}
+                  progress={progress}
+                  evidence={activeThread?.evidence ?? []}
                   modelName={config.modelName}
                   hasApiKey={apiKeyReady && Boolean(config.apiKey)}
                   systemHealth={systemHealth}
@@ -1371,6 +1376,8 @@ const CustomThread = ({
   chatHistory,
   isSearching,
   statusText,
+  progress,
+  evidence,
   modelName,
   hasApiKey,
   systemHealth,
@@ -1384,6 +1391,8 @@ const CustomThread = ({
   chatHistory: ChatMessage[];
   isSearching: boolean;
   statusText: string;
+  progress: SearchProgress | null;
+  evidence: EvidenceChunk[];
   modelName: string;
   hasApiKey: boolean;
   systemHealth: ConfigHealth | null;
@@ -1445,11 +1454,13 @@ const CustomThread = ({
                     msg={msg}
                     index={index}
                     disabled={isSearching}
+                    evidence={evidence}
                     onCopy={onCopyMessage}
                     onEdit={onEditMessage}
                     onDelete={onDeleteMessage}
                   />
                 ))}
+                {isSearching && progress && <SearchProgressCard progress={progress} />}
               </div>
             </ThreadPrimitive.Viewport>
 
@@ -1511,6 +1522,29 @@ const ThreadEmptyState = ({
         large
       />
       <SuggestionChips isSearching={isSearching} handleSendQuery={handleSendQuery} />
+      <Box
+        sx={{
+          mt: 4,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flexWrap: "wrap",
+          gap: 0.75,
+          fontSize: 12,
+          color: "rgba(255,255,255,0.45)",
+        }}
+      >
+        <span>描述需求</span>
+        <span aria-hidden>→</span>
+        <span>多源检索（arXiv · OpenAlex · Crossref）</span>
+        <span aria-hidden>→</span>
+        <span>LLM 审核迭代</span>
+        <span aria-hidden>→</span>
+        <span>全文证据报告</span>
+      </Box>
+      <Typography sx={{ mt: 1, fontSize: 11.5, color: "rgba(255,255,255,0.3)", textAlign: "center" }}>
+        一次检索通常需要 2–5 分钟：会下载并解析论文正文，生成带正文引用的报告，期间消耗模型额度。
+      </Typography>
       <SystemStatusBar
         hasApiKey={hasApiKey}
         model={modelName}
@@ -1687,6 +1721,7 @@ const ThreadMessage = ({
   msg,
   index,
   disabled,
+  evidence,
   onCopy,
   onEdit,
   onDelete,
@@ -1694,6 +1729,7 @@ const ThreadMessage = ({
   msg: ChatMessage;
   index: number;
   disabled: boolean;
+  evidence: EvidenceChunk[];
   onCopy: (content: string) => void;
   onEdit: (message: ChatMessage, visualIndex: number, content: string) => Promise<void>;
   onDelete: (message: ChatMessage, visualIndex: number) => Promise<void>;
@@ -1701,6 +1737,19 @@ const ThreadMessage = ({
   const isUser = msg.role === "user";
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(msg.content);
+  const [citeTarget, setCiteTarget] = useState<{ ref: CitationRef; chunk?: EvidenceChunk } | null>(null);
+
+  // 事件委托：markdown 由 dangerouslySetInnerHTML 渲染，无法挂 React 组件，
+  // 通过 closest(".aui-citation") 捕获徽标点击并匹配证据切片。
+  const handleCitationClick = (e: ReactMouseEvent<HTMLDivElement>) => {
+    const el = (e.target as HTMLElement).closest(".aui-citation");
+    if (!el) return;
+    const ref: CitationRef = {
+      paperTitle: el.getAttribute("data-cite-title") || "",
+      chunkIndex: el.getAttribute("data-cite-chunk") || "",
+    };
+    setCiteTarget({ ref, chunk: matchEvidence(ref, evidence) });
+  };
 
   useEffect(() => {
     if (!editing) setDraft(msg.content);
@@ -1848,9 +1897,11 @@ const ThreadMessage = ({
           <div className="mb-1 flex justify-end">{actions}</div>
           <div
             className="markdown-body"
+            onClick={handleCitationClick}
             dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
           />
         </div>
+        {citeTarget && <EvidenceDialog target={citeTarget} onClose={() => setCiteTarget(null)} />}
       </div>
     );
   }
@@ -1865,9 +1916,96 @@ const ThreadMessage = ({
         }`}
       >
         <div className="mb-1 flex justify-end">{actions}</div>
-        <div className="markdown-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+        <div
+          className="markdown-body"
+          onClick={handleCitationClick}
+          dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }}
+        />
       </div>
+      {citeTarget && <EvidenceDialog target={citeTarget} onClose={() => setCiteTarget(null)} />}
     </div>
+  );
+};
+
+const EvidenceDialog = ({
+  target,
+  onClose,
+}: {
+  target: { ref: CitationRef; chunk?: EvidenceChunk };
+  onClose: () => void;
+}) => {
+  const { ref, chunk } = target;
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      maxWidth="sm"
+      fullWidth
+      slotProps={{
+        paper: {
+          sx: {
+            borderRadius: 2,
+            bgcolor: "rgba(18,18,22,0.97)",
+            border: "1px solid rgba(255,255,255,0.12)",
+          },
+        },
+      }}
+    >
+      <DialogTitle sx={{ fontSize: 15, fontWeight: 760, pb: 1 }}>正文证据</DialogTitle>
+      <DialogContent>
+        <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75, mb: 1.5 }}>
+          <Chip
+            size="small"
+            label={chunk?.paper_title || ref.paperTitle}
+            sx={{
+              maxWidth: "100%",
+              "& .MuiChip-label": { overflow: "hidden", textOverflow: "ellipsis" },
+              bgcolor: "rgba(255,255,255,0.08)",
+              color: "rgba(255,255,255,0.85)",
+            }}
+          />
+          <Chip
+            size="small"
+            label={`分块 ${ref.chunkIndex}`}
+            sx={{ bgcolor: "rgba(99,179,237,0.16)", color: "#9cc8f5" }}
+          />
+          {chunk?.retrieval_sources.map((s) => (
+            <Chip
+              key={s}
+              size="small"
+              label={s}
+              sx={{ bgcolor: "rgba(255,255,255,0.06)", color: "rgba(255,255,255,0.6)" }}
+            />
+          ))}
+        </Box>
+        {chunk ? (
+          <Box
+            sx={{
+              maxHeight: 320,
+              overflowY: "auto",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              fontSize: 13,
+              lineHeight: 1.7,
+              color: "rgba(255,255,255,0.8)",
+              p: 1.5,
+              borderRadius: 1.5,
+              bgcolor: "rgba(255,255,255,0.04)",
+              border: "1px solid rgba(255,255,255,0.08)",
+            }}
+          >
+            {chunk.text}
+          </Box>
+        ) : (
+          <Typography sx={{ fontSize: 13, color: "rgba(255,255,255,0.6)", lineHeight: 1.7 }}>
+            未找到匹配的证据切片：该引用未命中当前线程的证据库（可能基于摘要/元数据，或来自未持久化的历史轮次）。
+          </Typography>
+        )}
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>关闭</Button>
+      </DialogActions>
+    </Dialog>
   );
 };
 
@@ -1933,6 +2071,109 @@ const MessageActions = ({
 const messageActionButtonClass =
   "grid size-7 place-items-center rounded-full opacity-65 transition hover:bg-white/10 hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-35";
 
+// ===================== 检索进度时间线 =====================
+
+const PROGRESS_ORDER: Array<{ key: SearchProgress["stage"]; label: string; chatLabel?: string }> = [
+  { key: "parse", label: "理解需求", chatLabel: "理解问题" },
+  { key: "search", label: "多源检索" },
+  { key: "review", label: "审核结果" },
+  { key: "pdf", label: "解析正文", chatLabel: "正文索引" },
+  { key: "report", label: "生成报告", chatLabel: "生成回复" },
+];
+
+const SearchProgressCard = ({ progress }: { progress: SearchProgress }) => {
+  // 每秒 tick 刷新已用时长
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const endRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "nearest" });
+  }, [progress.stage, progress.detail]);
+
+  const elapsed = Math.max(0, Math.floor((Date.now() - progress.startedAt) / 1000));
+  const elapsedText = `${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")}`;
+  const activeIdx = PROGRESS_ORDER.findIndex((s) => s.key === progress.stage);
+
+  return (
+    <div
+      ref={endRef}
+      className="w-full rounded-[18px] border border-white/10 bg-[#101013] px-4 py-3.5 shadow-sm"
+    >
+      <div className="flex items-center">
+        {PROGRESS_ORDER.map((step, i) => {
+          const done = i < activeIdx;
+          const active = i === activeIdx;
+          const label = progress.isSearchFlow ? step.label : (step.chatLabel ?? step.label);
+          return (
+            <div key={step.key} className="flex min-w-0 flex-1 items-center last:flex-none">
+              <div className="flex flex-col items-center gap-1">
+                <div
+                  className={`grid size-6 place-items-center rounded-full border text-[11px] font-bold transition-colors ${
+                    done
+                      ? "border-emerald-400/60 bg-emerald-400/15 text-emerald-300"
+                      : active
+                        ? "border-white/70 bg-white/15 text-white"
+                        : "border-white/12 bg-transparent text-white/30"
+                  }`}
+                >
+                  {done ? "✓" : i + 1}
+                </div>
+                <span
+                  className={`whitespace-nowrap text-[10.5px] ${
+                    active ? "font-semibold text-white/90" : done ? "text-emerald-300/80" : "text-white/35"
+                  }`}
+                >
+                  {label}
+                </span>
+              </div>
+              {i < PROGRESS_ORDER.length - 1 && (
+                <div
+                  className={`mx-1 mb-4 h-px flex-1 ${done ? "bg-emerald-400/40" : "bg-white/10"}`}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+        {progress.round > 0 && (
+          <Chip
+            size="small"
+            label={`第 ${progress.round} 轮`}
+            sx={{ height: 20, fontSize: 10.5, bgcolor: "rgba(255,255,255,0.07)", color: "rgba(255,255,255,0.7)" }}
+          />
+        )}
+        {progress.roundPapers.map((count, i) =>
+          count > 0 ? (
+            <Chip
+              key={i}
+              size="small"
+              label={`轮次 ${i + 1} · ${count} 篇`}
+              sx={{ height: 20, fontSize: 10.5, bgcolor: "rgba(99,179,237,0.12)", color: "#9cc8f5" }}
+            />
+          ) : null,
+        )}
+        <Chip
+          size="small"
+          label={`已用 ${elapsedText}`}
+          sx={{ height: 20, fontSize: 10.5, bgcolor: "rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.5)" }}
+        />
+      </div>
+
+      {progress.detail && (
+        <div className="mt-2 truncate text-xs leading-5 text-white/55" title={progress.detail}>
+          {progress.detail}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ===================== 研究资料面板 =====================
 
 const ResearchPanel = ({
@@ -1957,7 +2198,21 @@ const ResearchPanel = ({
   onClose: () => void;
   onExport: (type: ExportType) => void;
   onCopyReport: () => void;
-}) => (
+}) => {
+  const [citeTarget, setCiteTarget] = useState<{ ref: CitationRef; chunk?: EvidenceChunk } | null>(null);
+
+  // 与聊天区一致：事件委托捕获正文引用徽标点击
+  const handleCitationClick = (e: ReactMouseEvent<HTMLDivElement>) => {
+    const el = (e.target as HTMLElement).closest(".aui-citation");
+    if (!el) return;
+    const ref: CitationRef = {
+      paperTitle: el.getAttribute("data-cite-title") || "",
+      chunkIndex: el.getAttribute("data-cite-chunk") || "",
+    };
+    setCiteTarget({ ref, chunk: matchEvidence(ref, evidence) });
+  };
+
+  return (
   <Box
     sx={{
       position: { xs: "absolute", lg: "relative" },
@@ -2072,22 +2327,8 @@ const ResearchPanel = ({
                   color: "rgba(255,255,255,0.78)",
                   "& h1, & h2, & h3": { color: "#fff", mt: 2, mb: 1, fontWeight: 760 },
                   "& h3": { borderBottom: "1px solid rgba(255,255,255,0.08)", pb: 0.5 },
-                  // 引用证据徽标样式（来自 markdown.ts transformCitations）
-                  "& .aui-citation": {
-                    display: "inline-flex",
-                    alignItems: "center",
-                    mx: 0.25,
-                    px: 0.6,
-                    py: 0.1,
-                    borderRadius: 1,
-                    fontSize: "0.78rem",
-                    fontWeight: 600,
-                    bgcolor: "rgba(99,179,237,0.16)",
-                    color: "#9cc8f5",
-                    border: "1px solid rgba(99,179,237,0.4)",
-                    cursor: "default",
-                  },
                 }}
+                onClick={handleCitationClick}
                 dangerouslySetInnerHTML={{ __html: renderMarkdown(reportMd) }}
               />
               {evidence.length > 0 && (
@@ -2152,8 +2393,10 @@ const ResearchPanel = ({
         报告
       </Button>
     </Box>
+    {citeTarget && <EvidenceDialog target={citeTarget} onClose={() => setCiteTarget(null)} />}
   </Box>
-);
+  );
+};
 
 const PaperCard = ({ paper, index }: { paper: Paper; index: number }) => (
   <Card

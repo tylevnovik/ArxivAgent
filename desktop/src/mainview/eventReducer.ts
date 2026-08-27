@@ -188,3 +188,103 @@ export function withUserMessage(state: ThreadDetail, query: string): ThreadDetai
     ],
   };
 }
+
+// ===================== 检索进度推导 =====================
+
+/** 规范化阶段：时间线的五个步进节点。 */
+export type ProgressStage = "parse" | "search" | "review" | "pdf" | "report";
+
+export type SearchProgress = {
+  stage: ProgressStage;
+  /** 最新一条状态消息（进度卡片的动态文案）。 */
+  detail: string;
+  /** 当前检索轮次（追问/纯对话为 0）。 */
+  round: number;
+  /** 每轮检索获得的论文数（按轮次顺序）。 */
+  roundPapers: number[];
+  /** 是否出现过检索环节（区分"检索流"与"追问/对话流"的步骤文案）。 */
+  isSearchFlow: boolean;
+  /** 进度开始时间戳（展示已用时长）。 */
+  startedAt: number;
+};
+
+const STEP_TO_STAGE: Record<string, ProgressStage> = {
+  意图识别: "parse",
+  理解意图: "parse",
+  理解需求: "parse",
+  执行检索: "search",
+  错误恢复: "search",
+  审核结果: "review",
+  优化策略: "review",
+  解析正文: "pdf",
+  恢复正文索引: "pdf",
+  生成报告: "report",
+};
+
+/**
+ * 从事件信封增量推导检索进度。终态（done/error/cancelled）返回 null 清空。
+ * 纯函数，便于单测；UI 在 isSearching 时渲染推导结果。
+ */
+export function deriveProgress(
+  prev: SearchProgress | null,
+  env: AgentEventEnvelope,
+): SearchProgress | null {
+  if (env.type === "done" || env.type === "error" || env.type === "cancelled") {
+    return null;
+  }
+
+  const base: SearchProgress = prev ?? {
+    stage: "parse",
+    detail: env.message || "",
+    round: 0,
+    roundPapers: [],
+    isSearchFlow: false,
+    startedAt: Date.now(),
+  };
+
+  const step = String(((env.payload as { step?: unknown } | null)?.step) || "");
+  let next: SearchProgress = { ...base, detail: env.message || base.detail };
+
+  switch (env.type) {
+    case "searching":
+      next.stage = "search";
+      next.round = env.round || base.round || 1;
+      next.isSearchFlow = true;
+      break;
+    case "searching_done": {
+      next.stage = "search";
+      next.round = env.round || base.round;
+      next.isSearchFlow = true;
+      const papers = ((env.payload as { papers?: unknown[] } | null)?.papers || []).length;
+      const roundPapers = [...base.roundPapers];
+      const idx = Math.max(0, (env.round || roundPapers.length + 1) - 1);
+      roundPapers[idx] = papers;
+      next.roundPapers = roundPapers;
+      break;
+    }
+    case "reviewing":
+      next.stage = "review";
+      next.isSearchFlow = true;
+      break;
+    case "refining":
+      next.stage = "review";
+      next.isSearchFlow = true;
+      break;
+    case "report":
+      next.stage = "report";
+      break;
+    case "chat":
+      next.stage = "report";
+      break;
+    case "intent": {
+      const mapped = STEP_TO_STAGE[step];
+      if (mapped) next.stage = mapped;
+      break;
+    }
+    default:
+      // thinking 等：仅更新 detail（若有的话），不改变阶段
+      break;
+  }
+
+  return next;
+}
