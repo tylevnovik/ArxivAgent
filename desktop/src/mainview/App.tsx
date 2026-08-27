@@ -226,6 +226,11 @@ function App() {
     if (!bridge?.backend) return;
     let cancelled = false;
     (async () => {
+      // 冷启动时渲染进程可能先于后端就绪：先等 health（最多 20s），
+      // 仍未就绪才做环境诊断决定是否弹引导向导——避免依赖探测与后端
+      // 启动竞争资源导致探测超时、误弹向导。
+      const ready = await waitForBackend(20000);
+      if (cancelled || ready) return;
       try {
         const d = (await bridge.backend!.diagnose()) as {
           ok: boolean;

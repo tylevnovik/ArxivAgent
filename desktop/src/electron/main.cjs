@@ -286,8 +286,13 @@ async function gracefulShutdownBackend() {
 	try {
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), GRACEFUL_SHUTDOWN_TIMEOUT_MS);
+		const headers = {};
+		// /api/shutdown 受 HMAC 保护：有凭证时签名，否则会被 401 拒绝
+		const authorization = signAuthRequest("POST", "/api/shutdown");
+		if (authorization) headers.Authorization = authorization;
 		const res = await fetch(`${BACKEND_URL}/api/shutdown`, {
 			method: "POST",
+			headers,
 			signal: controller.signal,
 		});
 		clearTimeout(timer);
@@ -572,10 +577,19 @@ async function diagnoseBackend() {
 }
 
 async function startPythonBackend() {
-	// 1. 检查是否已有健康的后端（可能是上次残留或手动启动的）
+	// 1. 检查是否已有健康的后端
 	if (await isBackendHealthy()) {
-		console.log(`[Electron Main] Backend already healthy at ${BACKEND_URL}.`);
-		return { ok: true };
+		const stale = readStalePidFile();
+		if (!stale?.alive) {
+			// 无存活进程记录 → 外部手动启动的后端，可直接复用
+			console.log(`[Electron Main] Backend already healthy at ${BACKEND_URL}.`);
+			return { ok: true };
+		}
+		// 健康后端来自上一实例残留（PID 文件存活）：其 HMAC 凭证不属于本实例，
+		// 直接复用会让所有受签名保护的请求失败，必须清理后自己启动。
+		console.log(
+			`[Electron Main] Healthy backend belongs to a stale instance (PID ${stale.pid}); restarting our own.`
+		);
 	}
 
 	// 2. 清理残留进程（PID 文件 + 端口探测 + 强制杀）
