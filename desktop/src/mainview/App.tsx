@@ -374,6 +374,8 @@ function App() {
       const t = await createThread();
       setThreads((prev) => [t, ...prev]);
       await selectThread(t.id);
+      // 新对话没有文献/报告，关掉面板避免遮挡空状态首屏
+      setResearchOpen(false);
       setStatusText("新对话已准备好");
     } catch (err) {
       console.warn(err);
@@ -901,7 +903,7 @@ function App() {
         open={!!toast}
         autoHideDuration={3500}
         onClose={() => setToast(null)}
-        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+        anchorOrigin={{ vertical: "top", horizontal: "center" }}
       >
         {toast ? (
           <Alert
@@ -2216,8 +2218,10 @@ const ResearchPanel = ({
   <Box
     sx={{
       position: { xs: "absolute", lg: "relative" },
-      inset: { xs: 0, lg: "auto" },
+      // md–lg 浮层：右锚定（left:auto 让 width 生效），不再整列遮挡聊天区
+      inset: { xs: 0, md: "0 0 0 auto", lg: "auto" },
       zIndex: { xs: 30, lg: "auto" },
+      boxShadow: { xs: "-24px 0 48px rgba(0,0,0,0.55)", lg: "none" },
       width: { xs: "100%", md: 410, xl: 460 },
       maxWidth: { xs: "100%", md: "42vw" },
       minWidth: { md: 360 },
