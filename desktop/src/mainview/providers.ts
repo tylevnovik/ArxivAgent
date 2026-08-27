@@ -27,6 +27,11 @@
  *     旗舰 mimo-v2.5-pro（1M 上下文），配 mimo-v2.5（多模态）。
  *     Token Plan 国内站 base_url: https://token-plan-cn.xiaomimimo.com/v1
  *     按量付费 base_url: https://api.xiaomimimo.com/v1（Key 与 Token Plan 不互通）。
+ * - OpenCode Go（opencode.ai/docs/go/）：订阅制聚合网关，OpenAI 兼容。
+ *     base_url: https://opencode.ai/zen/go/v1；已实测（2026-08）：
+ *     deepseek-v4-flash / glm-5.3 输出干净 JSON 适合本应用；
+ *     kimi-k3 强制 temperature=1（本应用固定 0.3，不兼容）；
+ *     minimax-m3 思考内容混入正文（报告会被污染）；qwen3.8-max 偏慢。
  *
  * 字段说明：
  * - id：内部标识，存进 AppConfig.provider
@@ -119,6 +124,23 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		keyHint: "留空则用环境变量 MIMO_API_KEY",
 		docsUrl: "https://platform.xiaomimimo.com/token-plan",
 		note: "国内直连。Token Plan 订阅包（¥39/月起），Key 与按量付费不互通。旗舰 mimo-v2.5-pro（1M 上下文）。",
+	},
+	{
+		id: "opencode-go",
+		label: "OpenCode Go（订阅网关）",
+		endpoint: "https://opencode.ai/zen/go/v1",
+		defaultModel: "deepseek-v4-flash",
+		models: [
+			"deepseek-v4-flash",
+			"deepseek-v4-pro",
+			"glm-5.3",
+			"glm-5.3-flash",
+			"qwen3.8-max",
+			"mimo-v2.5-pro",
+		],
+		keyHint: "填入 OpenCode Go 订阅的 API Key",
+		docsUrl: "https://opencode.ai/docs/go/",
+		note: "订阅制聚合网关（一个 Key 用多家模型）。推荐 deepseek-v4-flash（快且 JSON 稳）；kimi-k3 不兼容（强制 temperature=1），minimax 系列思考内容会混入正文。",
 	},
 	{
 		id: "custom",

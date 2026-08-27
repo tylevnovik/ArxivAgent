@@ -44,7 +44,7 @@ import {
   ContentCopy as ContentCopyIcon,
   Article as ArticleIcon,
   MenuBook as MenuBookIcon,
-  FolderZip as FolderZipIcon,
+  TableChart as TableChartIcon,
   ExpandMore as ExpandMoreIcon,
   ArrowUpward as ArrowUpwardIcon,
   Stop as StopIcon,
@@ -1094,7 +1094,15 @@ const AppSidebar = ({
                       }
                     />
                   )}
-                  <Box sx={{ display: "flex" }}>
+                  <Box
+                    sx={{
+                      display: "flex",
+                      opacity: 0,
+                      transition: "opacity 120ms ease",
+                      ".MuiListItemButton-root:hover &": { opacity: 1 },
+                      "&:focus-within": { opacity: 1 },
+                    }}
+                  >
                     <Tooltip title="重命名">
                       <IconButton
                         size="small"
@@ -1222,9 +1230,11 @@ const ChatHeader = ({
         </IconButton>
       </Tooltip>
       <Box sx={{ minWidth: 0 }}>
-        <Typography noWrap sx={{ fontSize: 19, fontWeight: 760, maxWidth: 360 }}>
-          {title}
-        </Typography>
+        <Tooltip title={title}>
+          <Typography noWrap sx={{ fontSize: 19, fontWeight: 760, maxWidth: 360 }}>
+            {title}
+          </Typography>
+        </Tooltip>
         <Typography noWrap sx={{ fontSize: 12, color: "rgba(255,255,255,0.42)" }}>
           {isSearching ? statusText : STATUS_LABEL[threadStatus]}
         </Typography>
@@ -1234,12 +1244,13 @@ const ChatHeader = ({
     <Box className="app-no-drag" sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
       <Chip
         size="small"
-        label={isSearching ? "Running" : STATUS_LABEL[threadStatus]}
+        label={isSearching ? "检索中" : STATUS_LABEL[threadStatus]}
         sx={{
           display: { xs: "none", sm: "inline-flex" },
           height: 28,
           borderRadius: 99,
-          color: isSearching ? "#f5c451" : "#d7d7d7",
+          fontWeight: 650,
+          color: isSearching ? "#f5c451" : STATUS_CHIP_COLOR[threadStatus],
           bgcolor: "rgba(255,255,255,0.06)",
           border: "1px solid rgba(255,255,255,0.08)",
         }}
@@ -1304,6 +1315,14 @@ const ChatHeader = ({
     </Box>
   </Box>
 );
+
+const STATUS_CHIP_COLOR: Record<ThreadStatus, string> = {
+  idle: "rgba(255,255,255,0.62)",
+  running: "#f5c451",
+  done: "#4ade80",
+  error: "#f87171",
+  cancelled: "rgba(255,255,255,0.62)",
+};
 
 const WindowControls = () => {
   const controls = window.arxivAgentDesktop?.windowControls;
@@ -1603,7 +1622,7 @@ const ComposerPanel = ({
           <KeyboardArrowDownIcon sx={{ fontSize: 18, color: "rgba(255,255,255,0.46)" }} />
         </button>
         <span className="hidden max-w-[260px] truncate text-xs text-neutral-500 md:inline">
-          {statusText}
+          {isSearching ? statusText : ""}
         </span>
       </div>
 
@@ -1845,7 +1864,7 @@ const ThreadMessage = ({
             : "border-white/8 bg-[#101010] text-neutral-100"
         }`}
       >
-        <div className={`mb-1 flex ${isUser ? "justify-start" : "justify-end"}`}>{actions}</div>
+        <div className="mb-1 flex justify-end">{actions}</div>
         <div className="markdown-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
       </div>
     </div>
@@ -1941,9 +1960,9 @@ const ResearchPanel = ({
 }) => (
   <Box
     sx={{
-      position: { xs: "absolute", md: "relative" },
-      inset: { xs: 0, md: "auto" },
-      zIndex: { xs: 30, md: "auto" },
+      position: { xs: "absolute", lg: "relative" },
+      inset: { xs: 0, lg: "auto" },
+      zIndex: { xs: 30, lg: "auto" },
       width: { xs: "100%", md: 410, xl: 460 },
       maxWidth: { xs: "100%", md: "42vw" },
       minWidth: { md: 360 },
@@ -2110,7 +2129,7 @@ const ResearchPanel = ({
       <Button
         size="small"
         variant="outlined"
-        startIcon={<FolderZipIcon />}
+        startIcon={<TableChartIcon />}
         disabled={papersList.length === 0}
         onClick={() => onExport("csv")}
       >
