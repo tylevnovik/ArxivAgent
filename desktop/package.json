@@ -17,8 +17,8 @@
 		"dev": "concurrently \"bun run hmr\" \"electron .\"",
 		"dev:hmr": "bun run dev",
 		"hmr": "vite --port 5173",
-		"pack": "bun run prepare:backend-runtime && bun run build && electron-builder --dir",
-		"build:canary": "bun run prepare:backend-runtime && bun run build && electron-builder --win nsis"
+		"pack": "uv sync --extra dev && bun run prepare:backend-runtime && bun run build && electron-builder --dir",
+		"build:canary": "uv sync --extra dev && bun run prepare:backend-runtime && bun run build && electron-builder --win nsis"
 	},
 	"dependencies": {
 		"@assistant-ui/react": "^0.14.18",
