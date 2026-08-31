@@ -17,11 +17,16 @@ import os
 import re
 import secrets
 import threading
+import tempfile
 from datetime import datetime
 from typing import Optional
 
 import config
 from core.memory import Memory
+
+
+THREAD_SCHEMA_VERSION = 2
+CORRUPT_THREADS_DIR = ".corrupt"
 
 
 def _now_iso() -> str:
@@ -68,6 +73,7 @@ class Thread:
 
     def serialize(self) -> dict:
         return {
+            "schema_version": THREAD_SCHEMA_VERSION,
             "id": self.id,
             "title": self.title,
             "status": self.status,
@@ -79,15 +85,35 @@ class Thread:
 
     @classmethod
     def deserialize(cls, data: dict) -> "Thread":
-        return cls(
-            thread_id=str(data.get("id", "") or _new_thread_id()),
-            title=str(data.get("title", "") or "新对话"),
-            status=str(data.get("status", "idle") or "idle"),
-            created_at=str(data.get("created_at", "") or ""),
-            updated_at=str(data.get("updated_at", "") or ""),
-            memory=Memory.deserialize(data.get("memory", {}) or {}),
-            last_error=data.get("last_error"),
+        if not isinstance(data, dict):
+            raise ValueError("线程文件根节点必须是 JSON 对象")
+        try:
+            version = int(data.get("schema_version", 1) or 1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("线程 schema_version 无效") from exc
+        if version > THREAD_SCHEMA_VERSION:
+            raise ValueError(
+                f"线程 schema_version={version} 高于当前版本 {THREAD_SCHEMA_VERSION}"
+            )
+
+        # v1 没有 schema_version，且少数早期快照把历史称为 history；
+        # 迁移只补结构，不改变用户内容。
+        normalized = dict(data)
+        memory = dict(normalized.get("memory", {}) or {})
+        if "conversation" not in memory and "history" in memory:
+            memory["conversation"] = list(memory.get("history", []) or [])
+        normalized["memory"] = memory
+        thread = cls(
+            thread_id=str(normalized.get("id", "") or _new_thread_id()),
+            title=str(normalized.get("title", "") or "新对话"),
+            status=str(normalized.get("status", "idle") or "idle"),
+            created_at=str(normalized.get("created_at", "") or ""),
+            updated_at=str(normalized.get("updated_at", "") or ""),
+            memory=Memory.deserialize(memory),
+            last_error=normalized.get("last_error"),
         )
+        thread._loaded_schema_version = version
+        return thread
 
     # ---------- 派生字段 ----------
 
@@ -133,6 +159,7 @@ class Thread:
             "papers": self.papers,
             "report": self.memory.final_report,
             "evidence": self.memory.evidence_chunks,
+            "citation_check": self.memory.citation_check,
         }
 
     # ---------- 持久化 ----------
@@ -145,10 +172,21 @@ class Thread:
         self.updated_at = _now_iso()
         path = self._path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.serialize(), f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(
+            prefix=f".{self.id}.", suffix=".tmp", dir=os.path.dirname(path)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.serialize(), f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
         return path
 
     def delete(self) -> bool:
@@ -175,6 +213,14 @@ class TaskHandle:
         self.finished = threading.Event()
 
 
+class ThreadDeletedError(RuntimeError):
+    """任务启动时线程已被删除。"""
+
+
+class ThreadBusyError(RuntimeError):
+    """线程已有一个活跃任务，不能启动第二个任务或修改标题。"""
+
+
 class ThreadManager:
     """
     线程存储 + 运行期任务索引的统一入口。
@@ -184,6 +230,9 @@ class ThreadManager:
 
     def __init__(self):
         self._tasks: dict[str, TaskHandle] = {}
+        # 删除中的线程 tombstone：worker 收尾期间仍可能持有旧 Thread 对象，
+        # tombstone 防止它把已删除的 JSON 重新写回磁盘。
+        self._deleted_ids: set[str] = set()
         self._lock = threading.Lock()
 
     # ---------- 列表 / CRUD ----------
@@ -200,9 +249,9 @@ class ThreadManager:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 entries.append(Thread.deserialize(data))
-            except (OSError, json.JSONDecodeError):
-                # 跳过损坏文件，不阻塞列表
-                continue
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                # 隔离损坏/未来版本文件，避免每次刷新都重复报错；不阻塞列表。
+                self._quarantine_corrupt(path, str(exc))
         entries.sort(key=lambda t: t.updated_at, reverse=True)
         return entries
 
@@ -216,8 +265,58 @@ class ThreadManager:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return Thread.deserialize(json.load(f))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
             return None
+
+    def _quarantine_corrupt(self, path: str, reason: str = "") -> None:
+        """把不可读线程快照移到 .corrupt，原文件永远不作为有效线程加载。"""
+        if not os.path.exists(path):
+            return
+        try:
+            quarantine_dir = os.path.join(config.THREADS_DIR, CORRUPT_THREADS_DIR)
+            os.makedirs(quarantine_dir, exist_ok=True)
+            name = os.path.basename(path)
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+            destination = os.path.join(quarantine_dir, f"{name}.{stamp}.bad")
+            os.replace(path, destination)
+            if reason:
+                with open(destination + ".reason", "w", encoding="utf-8") as f:
+                    f.write(reason[:500])
+        except OSError:
+            # 隔离失败不应阻塞用户读取其他线程。
+            pass
+
+    def recover_interrupted(self) -> dict[str, int]:
+        """启动时迁移旧快照，并把上次进程残留的 running 标为 interrupted。"""
+        stats = {"interrupted": 0, "migrated": 0, "quarantined": 0}
+        if not os.path.isdir(config.THREADS_DIR):
+            return stats
+        with self._lock:
+            for name in os.listdir(config.THREADS_DIR):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(config.THREADS_DIR, name)
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
+                    thread = Thread.deserialize(raw)
+                except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                    self._quarantine_corrupt(path, str(exc))
+                    stats["quarantined"] += 1
+                    continue
+
+                changed = int(raw.get("schema_version", 1) or 1) != THREAD_SCHEMA_VERSION
+                if thread.status == "running":
+                    thread.status = "interrupted"
+                    thread.last_error = (
+                        "后端在该任务运行期间退出，任务未完成；请重新发起检索。"
+                    )
+                    stats["interrupted"] += 1
+                    changed = True
+                if changed:
+                    thread.save()
+                    stats["migrated"] += 1
+        return stats
 
     def create(self, title: Optional[str] = None) -> Thread:
         thread = Thread(thread_id=_new_thread_id(), title=title or "新对话")
@@ -225,28 +324,63 @@ class ThreadManager:
         return thread
 
     def rename(self, thread_id: str, title: str) -> Optional[Thread]:
-        thread = self.get(thread_id)
-        if thread is None:
+        if not _is_valid_thread_id(thread_id):
             return None
-        thread.title = title
-        thread.save()
-        return thread
+        path = os.path.join(config.THREADS_DIR, f"{thread_id}.json")
+        with self._lock:
+            if thread_id in self._deleted_ids or not os.path.exists(path):
+                return None
+            handle = self._tasks.get(thread_id)
+            if handle is not None and not handle.finished.is_set():
+                raise ThreadBusyError(f"线程 {thread_id} 正在运行")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    thread = Thread.deserialize(json.load(f))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                return None
+            thread.title = title
+            thread.save()
+            return thread
 
     def delete(self, thread_id: str) -> bool:
-        thread = self.get(thread_id)
-        if thread is None:
+        if not _is_valid_thread_id(thread_id):
             return False
-        return thread.delete()
+        path = os.path.join(config.THREADS_DIR, f"{thread_id}.json")
+        with self._lock:
+            if not os.path.exists(path):
+                return False
+            self._deleted_ids.add(thread_id)
+            handle = self._tasks.get(thread_id)
+            if handle is not None and not handle.finished.is_set():
+                handle.cancel_event.set()
+            try:
+                os.remove(path)
+                return True
+            except OSError:
+                # 保留 tombstone；若 worker 稍后收尾，仍不得重新写回。
+                return False
+
+    def persist(self, thread: Thread, handle: Optional[TaskHandle] = None) -> bool:
+        """仅在线程仍有效时持久化；检查与写入在同一锁内完成。"""
+        with self._lock:
+            if thread.id in self._deleted_ids:
+                return False
+            if handle is not None and self._tasks.get(thread.id) is not handle:
+                return False
+            thread.save()
+            return True
 
     # ---------- 任务索引 ----------
 
     def start_task(self, thread_id: str) -> TaskHandle:
         """登记一个新任务，返回其 handle（含 cancel_event）。"""
         with self._lock:
+            if thread_id in self._deleted_ids:
+                raise ThreadDeletedError(f"线程 {thread_id} 已删除")
             # 同一线程已有任务在跑：先取消旧的（防止并发写同一线程）
             old = self._tasks.get(thread_id)
             if old and not old.finished.is_set():
-                old.cancel_event.set()
+                raise ThreadBusyError(f"线程 {thread_id} 已有任务在运行")
             handle = TaskHandle(thread_id)
             self._tasks[thread_id] = handle
             return handle
@@ -255,11 +389,14 @@ class ThreadManager:
         with self._lock:
             return self._tasks.get(thread_id)
 
-    def finish_task(self, thread_id: str) -> None:
+    def finish_task(self, thread_id: str, handle: Optional[TaskHandle] = None) -> None:
         with self._lock:
-            handle = self._tasks.get(thread_id)
-            if handle:
-                handle.finished.set()
+            current = self._tasks.get(thread_id)
+            if current is None or (handle is not None and current is not handle):
+                return
+            current.finished.set()
+            self._tasks.pop(thread_id, None)
+            self._deleted_ids.discard(thread_id)
 
     def request_cancel(self, thread_id: str) -> bool:
         """请求取消某线程当前任务。返回是否找到了在跑的任务。"""

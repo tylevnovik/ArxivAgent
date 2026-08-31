@@ -5,6 +5,7 @@
 import json
 import os
 import queue
+import asyncio
 import signal
 import threading
 import atexit
@@ -50,7 +51,12 @@ from core.contracts import (
 )
 from core.llm import CancelledError
 from core.memory import Memory
-from core.threads import Thread, thread_manager
+from core.providers import (
+    ProviderConfigError,
+    ResolvedProviderConfig,
+    resolve_provider_config,
+)
+from core.threads import Thread, ThreadBusyError, ThreadDeletedError, thread_manager
 from core import exporter
 import config
 
@@ -165,12 +171,17 @@ app = FastAPI(title=f"多源论文检索 Agent v{config.APP_VERSION}")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    # 本地后端不走 cookie/凭据，allow_credentials=False 与 allow_origins=["*"]
-    # 是浏览器规范允许的唯一组合（带 credentials 的通配源会被规范禁止）。
+    # 只允许本地 Vite 开发页与 Electron file 页面访问，避免任意网页调用
+    # localhost 上的 API（尤其是配置健康探测）。
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "file://",
+        "null",
+    ],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -243,6 +254,7 @@ def _envelope_from_agent_event(event: AgentEvent) -> AgentEventEnvelope:
         return AgentEventEnvelope(
             type="searching_done", message=event.content, round=r,
             payload={"papers": [Paper.from_dict(p).model_dump() for p in papers],
+                     "provider_statuses": (event.data or {}).get("provider_statuses", []),
                      "step": event.step_name},
         )
     if et == EventType.REVIEW:
@@ -278,7 +290,8 @@ def _envelope_from_agent_event(event: AgentEvent) -> AgentEventEnvelope:
             payload={"kind": "search",
                      "papers": [Paper.from_dict(p).model_dump() for p in final_papers],
                      "report": report,
-                     "evidence": [EvidenceChunk.from_dict(e).model_dump() for e in evidence]},
+                     "evidence": [EvidenceChunk.from_dict(e).model_dump() for e in evidence],
+                     "citation_check": data.get("citation_check", {})},
         )
     # STEP_START 及其它：归一化为 intent（步骤提示）
     return AgentEventEnvelope(type="intent", message=event.content, round=r,
@@ -368,7 +381,15 @@ def api_rename_thread(thread_id: str, body: ThreadPatchRequest):
     title = (body.title or "").strip()
     if not title:
         return _error_json(ErrorCode.VALIDATION, "标题不能为空", status_code=400)
-    thread = thread_manager.rename(thread_id, title)
+    try:
+        thread = thread_manager.rename(thread_id, title)
+    except ThreadBusyError:
+        return _error_json(
+            ErrorCode.THREAD_BUSY,
+            "该线程正在运行，完成或停止后才能重命名。",
+            recoverable=True,
+            status_code=409,
+        )
     if thread is None:
         return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
                            recoverable=False, status_code=404)
@@ -434,7 +455,9 @@ def api_patch_thread_message(thread_id: str, message_index: int, body: MessagePa
     if not message.get("timestamp"):
         message["timestamp"] = datetime.now().isoformat()
     _sync_derived_message_fields(thread, old_content, content)
-    thread.save()
+    if not thread_manager.persist(thread):
+        return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
+                           recoverable=False, status_code=404)
     return ThreadDetail(**thread.detail_dict())
 
 
@@ -454,14 +477,15 @@ def api_delete_thread_message(thread_id: str, message_index: int):
     old_content = str(message.get("content", "") or "")
     del thread.memory.conversation[message_index]
     _sync_derived_message_fields(thread, old_content, "")
-    thread.save()
+    if not thread_manager.persist(thread):
+        return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
+                           recoverable=False, status_code=404)
     return ThreadDetail(**thread.detail_dict())
 
 
 @app.delete("/api/threads/{thread_id}")
 def api_delete_thread(thread_id: str):
-    # 若该线程有任务在跑，先请求取消
-    thread_manager.request_cancel(thread_id)
+    # delete 内部先写 tombstone、再发取消并移除 JSON，阻断 worker 收尾复活。
     ok = thread_manager.delete(thread_id)
     if not ok:
         return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
@@ -484,16 +508,21 @@ def _resolve_thread_for_message(thread_id: str) -> tuple[Optional[Thread], Optio
     return thread, None
 
 
-def _build_agent_for_thread(thread: Thread, msg: MessageRequest, api_key: str) -> ArxivAgent:
+def _build_agent_for_thread(
+    thread: Thread,
+    msg: MessageRequest,
+    llm_config: ResolvedProviderConfig,
+) -> ArxivAgent:
     provider_settings = {
         "openalex_mailto": (msg.openalex_mailto or "").strip(),
         "crossref_mailto": (msg.crossref_mailto or "").strip(),
         "semantic_scholar_api_key": (msg.semantic_scholar_api_key or "").strip(),
     }
     agent = ArxivAgent(
-        api_key=api_key,
-        base_url=msg.base_url or None,
-        model=msg.model or None,
+        api_key=llm_config.api_key,
+        base_url=llm_config.endpoint,
+        model=llm_config.model,
+        provider=llm_config.provider,
         max_search_rounds=msg.max_search_rounds,
         max_results_per_round=msg.max_results_per_round,
         providers=msg.providers,
@@ -511,6 +540,16 @@ def _run_agent_worker(thread: Thread, agent: ArxivAgent, query: str,
     last_error: Optional[str] = None
     try:
         for event in agent.chat(query):
+            if event.event_type == EventType.ERROR:
+                final_status = "error"
+                last_error = event.content or "Agent 返回错误事件"
+            elif event.event_type == EventType.DONE:
+                if (event.data or {}).get("cancelled"):
+                    final_status = "cancelled"
+                    last_error = None
+                else:
+                    final_status = "done"
+                    last_error = None
             if handle.cancel_event.is_set():
                 # 已取消：让 chat 内部边界抛 CancelledError；这里不重复处理
                 pass
@@ -535,7 +574,7 @@ def _run_agent_worker(thread: Thread, agent: ArxivAgent, query: str,
             )
             thread.title = (first_user[:30] + ("…" if len(first_user) > 30 else "")) or "新对话"
         try:
-            thread.save()
+            thread_manager.persist(thread, handle)
         except Exception as save_err:
             # 持久化失败要让用户知道，而不是静默吞掉（否则 UI 显示成功但下次刷新数据丢了）
             import traceback as _tb
@@ -545,7 +584,9 @@ def _run_agent_worker(thread: Thread, agent: ArxivAgent, query: str,
                 type="error",
                 message=f"⚠️ 检索已完成，但结果未能保存到磁盘：{save_err}。可重试或导出当前结果。",
             ))
-        thread_manager.finish_task(thread.id)
+        # 线程已删除时 persist 返回 False；finish_task 只清理运行期索引，
+        # 不会再次把旧 Thread 写回磁盘。
+        thread_manager.finish_task(thread.id, handle)
         out_queue.put(None)  # 哨兵
 
 
@@ -559,12 +600,25 @@ async def api_thread_message(thread_id: str, body: MessageRequest):
     if not query:
         return _error_json(ErrorCode.VALIDATION, "query 不能为空", status_code=400)
 
-    # 解析 API Key：请求 > 环境变量
-    api_key = (body.api_key or "").strip()
-    if not api_key:
+    try:
+        llm_config = resolve_provider_config(
+            provider=body.provider,
+            api_key=body.api_key,
+            base_url=body.base_url,
+            model=body.model,
+        )
+    except ProviderConfigError as e:
+        return _error_json(
+            ErrorCode.INVALID_PROVIDER,
+            str(e),
+            recoverable=True, status_code=400,
+        )
+
+    if llm_config.requires_api_key and not llm_config.api_key:
+        env_hint = llm_config.api_key_env or "对应的 API_KEY 环境变量"
         return _error_json(
             ErrorCode.NO_API_KEY,
-            "未提供 API Key。请在设置中配置，或设置环境变量 DEEPSEEK_API_KEY。",
+            f"未提供 API Key。请在设置中配置，或设置环境变量 {env_hint}。",
             recoverable=True, status_code=400,
         )
 
@@ -584,7 +638,7 @@ async def api_thread_message(thread_id: str, body: MessageRequest):
     # 构造 agent：捕获 _make_provider 抛出的 ValueError 等构造期错误，
     # 转成结构化 invalid_provider 错误（防御性兜底，正常路径已被上面的校验拦下）。
     try:
-        agent = _build_agent_for_thread(thread, body, api_key)
+        agent = _build_agent_for_thread(thread, body, llm_config)
     except ValueError as e:
         return _error_json(
             ErrorCode.INVALID_PROVIDER,
@@ -592,7 +646,18 @@ async def api_thread_message(thread_id: str, body: MessageRequest):
             recoverable=True, status_code=400,
         )
 
-    handle = thread_manager.start_task(thread.id)
+    try:
+        handle = thread_manager.start_task(thread.id)
+    except ThreadBusyError:
+        return _error_json(
+            ErrorCode.THREAD_BUSY,
+            "该线程已有检索任务在运行，请等待完成或先停止。",
+            recoverable=True,
+            status_code=409,
+        )
+    except ThreadDeletedError:
+        return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
+                           recoverable=False, status_code=404)
     agent.cancel_event = handle.cancel_event
 
     out_queue: "queue.Queue[Optional[AgentEventEnvelope]]" = queue.Queue()
@@ -603,7 +668,10 @@ async def api_thread_message(thread_id: str, body: MessageRequest):
     )
     handle.worker = worker
     thread.status = "running"
-    thread.save()
+    if not thread_manager.persist(thread, handle):
+        thread_manager.finish_task(thread.id, handle)
+        return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
+                           recoverable=False, status_code=404)
     worker.start()
 
     async def ndjson_generator():
@@ -611,7 +679,10 @@ async def api_thread_message(thread_id: str, body: MessageRequest):
             # 标记运行开始
             yield AgentEventEnvelope(type="intent", message="Agent 已启动…").model_dump_json() + "\n"
             while True:
-                item = out_queue.get()
+                # queue.Queue.get() is blocking; running it directly here would
+                # stall FastAPI's event loop and unrelated requests.  The worker
+                # thread remains the producer, while the wait is offloaded.
+                item = await asyncio.to_thread(out_queue.get)
                 if item is None:
                     break
                 yield item.model_dump_json() + "\n"
@@ -654,7 +725,7 @@ def api_thread_report(thread_id: str):
 def _ping_llm(api_key: str, base_url: str, model: str) -> tuple[bool, str]:
     """发一次最小 ping 验证模型可达。超时 5s。"""
     try:
-        client = OpenAI(api_key=api_key, base_url=base_url, timeout=5.0)
+        client = OpenAI(api_key=api_key or "not-needed", base_url=base_url, timeout=5.0)
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "ping"}],
@@ -704,22 +775,36 @@ def _ping_provider(name: str, settings: dict) -> ProviderHealth:
 
 @app.post("/api/config/health")
 def api_config_health(body: ConfigHealthRequest):
-    # 解析 key 来源
-    req_key = (body.api_key or "").strip()
-    env_key = config.DEEPSEEK_API_KEY
-    if req_key:
-        api_key = req_key
-        source = "request"
-    elif env_key:
-        api_key = env_key
-        source = "env"
-    else:
-        api_key = ""
-        source = "none"
+    try:
+        llm_config = resolve_provider_config(
+            provider=body.provider,
+            api_key=body.api_key,
+            base_url=body.base_url,
+            model=body.model,
+        )
+        config_error = ""
+    except ProviderConfigError as e:
+        llm_config = None
+        config_error = str(e)
 
-    endpoint = body.base_url or config.DEEPSEEK_BASE_URL
-    model = body.model or config.DEEPSEEK_MODEL
-    provider = body.provider or "deepseek"
+    if llm_config is None:
+        provider = (body.provider or "deepseek").strip().lower()
+        endpoint = (body.base_url or "").strip()
+        model = (body.model or "").strip()
+        api_key = (body.api_key or "").strip()
+        source = "request" if api_key else "none"
+        llm_reachable: Optional[bool] = False if body.ping_llm else None
+        llm_detail = config_error
+        credential_ok = False
+    else:
+        provider = llm_config.provider
+        endpoint = llm_config.endpoint
+        model = llm_config.model
+        api_key = llm_config.api_key
+        source = llm_config.api_key_source
+        llm_reachable = None
+        llm_detail = ""
+        credential_ok = (not llm_config.requires_api_key) or bool(api_key)
 
     # 检索源健康（并行太重，这里顺序 3s 超时即可）
     settings = {
@@ -730,16 +815,14 @@ def api_config_health(body: ConfigHealthRequest):
     provider_names = body.providers or config.SEARCH_PROVIDERS
     provider_health = [_ping_provider(n, settings) for n in provider_names if str(n).strip()]
 
-    llm_reachable: Optional[bool] = None
-    llm_detail = ""
-    if body.ping_llm:
-        if not api_key:
+    if body.ping_llm and llm_config is not None:
+        if not credential_ok:
             llm_reachable = False
-            llm_detail = "无 API Key"
+            llm_detail = f"无 API Key（请配置 {llm_config.api_key_env or '对应环境变量'}）"
         else:
             llm_reachable, llm_detail = _ping_llm(api_key, endpoint, model)
 
-    overall_ok = bool(api_key) and (llm_reachable in (None, True))
+    overall_ok = credential_ok and (llm_reachable in (None, True))
     return ConfigHealth(
         ok=overall_ok,
         api_key_configured=bool(api_key),
@@ -757,13 +840,14 @@ def api_config_health(body: ConfigHealthRequest):
 @app.get("/api/config/health")
 def api_config_health_get():
     """GET 版本：用进程默认配置，不 ping LLM。供前端轻量探测。"""
+    llm_config = resolve_provider_config()
     return ConfigHealth(
-        ok=bool(config.DEEPSEEK_API_KEY),
-        api_key_configured=bool(config.DEEPSEEK_API_KEY),
-        api_key_source="env" if config.DEEPSEEK_API_KEY else "none",
-        provider="deepseek",
-        endpoint=config.DEEPSEEK_BASE_URL,
-        model=config.DEEPSEEK_MODEL,
+        ok=(not llm_config.requires_api_key) or bool(llm_config.api_key),
+        api_key_configured=bool(llm_config.api_key),
+        api_key_source=llm_config.api_key_source,
+        provider=llm_config.provider,
+        endpoint=llm_config.endpoint,
+        model=llm_config.model,
         data_dir=config.DATA_DIR,
         llm_reachable=None,
         providers=[],
@@ -870,6 +954,16 @@ def api_shutdown():
 def on_startup():
     """服务启动时：写 PID 文件、生成 HMAC 密钥对、安装 signal handler。"""
     global _auth_secret, _auth_token
+
+    recovery = thread_manager.recover_interrupted()
+    if any(recovery.values()):
+        print(
+            "[Backend] thread recovery: "
+            f"interrupted={recovery['interrupted']}, "
+            f"migrated={recovery['migrated']}, "
+            f"quarantined={recovery['quarantined']}",
+            flush=True,
+        )
 
     # PID 文件
     try:

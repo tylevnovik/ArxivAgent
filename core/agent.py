@@ -21,6 +21,7 @@ from core import llm, arxiv_search
 from core.arxiv_search import SearchResult, SearchErrorType
 from core.llm import CancelledError
 from core.memory import Memory
+from core.providers import resolve_provider_config
 from core.search_service import SearchService
 
 
@@ -215,13 +216,25 @@ class ArxivAgent:
     """ArXiv 论文检索 Agent（支持多轮对话）"""
 
     def __init__(self, api_key: str = None, base_url: str = None, model: str = None,
+                 provider: str = None,
                  max_search_rounds: int = None, max_results_per_round: int = None,
                  providers: list[str] = None, provider_settings: dict[str, str] = None,
                  cancel_event=None):
         import threading
-        self.api_key = api_key or config.DEEPSEEK_API_KEY
-        self.base_url = base_url or config.DEEPSEEK_BASE_URL
-        self.model = model or config.DEEPSEEK_MODEL
+        resolved = resolve_provider_config(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+        )
+        self.provider = resolved.provider
+        self.api_key = resolved.api_key
+        self.base_url = resolved.endpoint
+        self.model = resolved.model
+        self.api_key_source = resolved.api_key_source
+        self.requires_api_key = resolved.requires_api_key
+        self._explicit_api_key = api_key
+        self._explicit_base_url = base_url
         self.max_search_rounds = max_search_rounds or config.MAX_SEARCH_ROUNDS
         self.max_results_per_round = max_results_per_round or config.MAX_RESULTS_PER_ROUND
         self.memory = Memory()
@@ -242,15 +255,37 @@ class ArxivAgent:
         self._rag_query_variants: list[str] = []
 
     def update_config(self, api_key: str = None, base_url: str = None, model: str = None,
+                      provider: str = None,
                       max_search_rounds: int = None, max_results_per_round: int = None,
                       providers: list[str] = None, provider_settings: dict[str, str] = None):
         """更新 Agent 运行配置"""
-        if api_key:
-            self.api_key = api_key
-        if base_url:
-            self.base_url = base_url
-        if model:
-            self.model = model
+        requested_provider = provider or self.provider
+        provider_changed = provider is not None and provider != self.provider
+        resolved = resolve_provider_config(
+            provider=requested_provider,
+            # Never carry a previous provider's key into a new provider.
+            api_key=api_key if api_key is not None else (
+                None if provider_changed else self._explicit_api_key
+            ),
+            base_url=base_url if base_url is not None else (
+                None if provider_changed else self._explicit_base_url
+            ),
+            # A provider switch should receive that provider's default/model
+            # environment value when the caller did not explicitly choose one.
+            model=model if model is not None else (None if provider_changed else self.model),
+        )
+        self.provider = resolved.provider
+        self.api_key = resolved.api_key
+        self.base_url = resolved.endpoint
+        self.model = resolved.model
+        self.api_key_source = resolved.api_key_source
+        self.requires_api_key = resolved.requires_api_key
+        self._explicit_api_key = api_key if api_key is not None else (
+            None if provider_changed else self._explicit_api_key
+        )
+        self._explicit_base_url = base_url if base_url is not None else (
+            None if provider_changed else self._explicit_base_url
+        )
         if max_search_rounds is not None:
             self.max_search_rounds = max_search_rounds
         if max_results_per_round is not None:
@@ -487,6 +522,7 @@ class ArxivAgent:
                 papers, search_success = yield from self._execute_search_with_recovery(
                     provider_query, arxiv_query, max_results, sort_by, round_num
                 )
+                provider_statuses = list(getattr(self, "_last_provider_statuses", []) or [])
 
                 if not search_success:
                     yield AgentEvent(EventType.ERROR,
@@ -494,11 +530,20 @@ class ArxivAgent:
                     return
 
                 self._has_searched = True
+                failed_sources = [
+                    str(status.get("source", ""))
+                    for status in provider_statuses
+                    if not status.get("ok", False)
+                ]
+                provider_note = (
+                    f"（{', '.join(failed_sources)} 失败，当前为部分来源结果）"
+                    if failed_sources else ""
+                )
 
                 yield AgentEvent(EventType.SEARCH_DONE, round_num=round_num,
                                  step_name="检索完成",
-                                 content=f"✅ 第 {round_num} 轮检索完成，获得 {len(papers)} 篇论文。",
-                                 data={"papers": papers})
+                                 content=f"✅ 第 {round_num} 轮检索完成，获得 {len(papers)} 篇论文。{provider_note}",
+                                 data={"papers": papers, "provider_statuses": provider_statuses})
 
                 if not papers:
                     yield AgentEvent(EventType.STEP_START, round_num=round_num,
@@ -534,6 +579,7 @@ class ArxivAgent:
                     results=papers,
                     review=review_result,
                     relevant_papers=relevant_papers,
+                    provider_statuses=provider_statuses,
                 )
 
                 yield AgentEvent(EventType.REVIEW, round_num=round_num,
@@ -619,6 +665,9 @@ class ArxivAgent:
                              content="📊 正在生成最终检索报告...")
 
             report_text = yield from self._step_report(user_query, final_papers)
+            self.memory.citation_check = validate_report_citations(
+                report_text, self.memory.evidence_chunks
+            )
 
             self.memory.set_final_results(final_papers, report_text, self.memory.evidence_chunks)
             self.memory.add_conversation("assistant", report_text)
@@ -627,7 +676,8 @@ class ArxivAgent:
                              content="✅ 检索完成！",
                              data={"final_papers": final_papers,
                                    "report": report_text,
-                                   "evidence": self.memory.evidence_chunks})
+                                   "evidence": self.memory.evidence_chunks,
+                                   "citation_check": self.memory.citation_check})
 
         except CancelledError:
             # 取消是预期内的正常终态，不带堆栈
@@ -673,6 +723,7 @@ class ArxivAgent:
                 sort_by=sort_by,
                 cancel_event=self.cancel_event,
             )
+            self._last_provider_statuses = list(search_result.provider_statuses or [])
 
             # 检索成功且有结果
             if search_result.success and search_result.papers:
@@ -1101,6 +1152,9 @@ def _format_rag_context(retrieved: list[dict]) -> str:
     for r in retrieved:
         title = r.get("paper_title", "未知论文")
         chunk_index = r.get("chunk_index", "N/A")
+        page_number = r.get("page_number")
+        page_end = r.get("page_end")
+        section_title = str(r.get("section_title", "") or "").strip()
         sources = ",".join(r.get("retrieval_sources", [])) or "unknown"
         score_bits = []
         if "hybrid_score" in r:
@@ -1113,10 +1167,59 @@ def _format_rag_context(retrieved: list[dict]) -> str:
             score_bits.append(f"rerank={r['rerank_score']:.4f}")
 
         meta = f"来源={sources}"
+        if page_number is not None:
+            page_label = f"页码={page_number}"
+            if page_end is not None and page_end != page_number:
+                page_label += f"-{page_end}"
+            meta += f" | {page_label}"
+        if section_title:
+            meta += f" | 章节={section_title}"
         if score_bits:
             meta += " | " + " | ".join(score_bits)
         blocks.append(
-            f"【正文: {title} | 分块 {chunk_index} | {meta}】\n"
+            # 引用标记保持稳定，元数据放在标记外；这样模型、后端校验和前端解析共享同一格式。
+            f"【正文: {title} | 分块 {chunk_index}】（{meta}）\n"
             f"{r.get('text', '')}"
         )
     return "\n\n".join(blocks)
+
+
+_REPORT_CITATION_RE = re.compile(
+    r"【正文:\s*([^|】]+?)\s*\|\s*分块\s*([0-9]+)(?:\s*\|[^】]*)?\s*】"
+)
+
+
+def _normalize_citation_title(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def validate_report_citations(report: str, evidence: list[dict]) -> dict:
+    """校验报告中的正文引用是否能回指本轮保存的 evidence chunk。"""
+    references = [
+        {"paper_title": match.group(1).strip(), "chunk_index": match.group(2).strip()}
+        for match in _REPORT_CITATION_RE.finditer(report or "")
+    ]
+    unmatched = []
+    for ref in references:
+        title = _normalize_citation_title(ref["paper_title"])
+        chunk_index = ref["chunk_index"]
+        matched = any(
+            (
+                bool(_normalize_citation_title(item.get("paper_title", "")))
+                and (
+                    _normalize_citation_title(item.get("paper_title", "")) == title
+                    or title.startswith(_normalize_citation_title(item.get("paper_title", "")))
+                    or _normalize_citation_title(item.get("paper_title", "")).startswith(title)
+                )
+            )
+            and str(item.get("chunk_index", "")) == chunk_index
+            for item in evidence or []
+        )
+        if not matched:
+            unmatched.append(ref)
+    return {
+        "total": len(references),
+        "matched": len(references) - len(unmatched),
+        "unmatched": unmatched,
+        "all_matched": not unmatched,
+    }

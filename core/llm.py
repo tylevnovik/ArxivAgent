@@ -34,7 +34,9 @@ def load_prompt(template_name: str, **kwargs) -> str:
 def get_client(api_key: str = None, base_url: str = None) -> OpenAI:
     """获取 OpenAI 兼容客户端"""
     return OpenAI(
-        api_key=api_key or config.DEEPSEEK_API_KEY,
+        # OpenAI's client requires a non-empty value even for local servers
+        # such as Ollama/vLLM that do not authenticate requests.
+        api_key=api_key or config.DEEPSEEK_API_KEY or "not-needed",
         base_url=base_url or config.DEEPSEEK_BASE_URL,
     )
 

@@ -85,6 +85,11 @@ class EvidenceChunk(BaseModel):
     hybrid_score: float = 0.0
     rerank_score: float = 0.0
     score: float = 0.0
+    page_number: Optional[int] = None
+    page_end: Optional[int] = None
+    section_title: str = ""
+    source_url: str = ""
+    pdf_url: str = ""
 
     model_config = {"extra": "allow"}
 
@@ -110,13 +115,18 @@ class EvidenceChunk(BaseModel):
             hybrid_score=float(data.get("hybrid_score", 0.0) or 0.0),
             rerank_score=float(data.get("rerank_score", 0.0) or 0.0),
             score=float(data.get("score", 0.0) or 0.0),
+            page_number=data.get("page_number"),
+            page_end=data.get("page_end"),
+            section_title=str(data.get("section_title", "") or ""),
+            source_url=str(data.get("source_url", "") or ""),
+            pdf_url=str(data.get("pdf_url", "") or ""),
         )
 
 
 # ===================== 线程 =====================
 
 # 线程 / 任务的可观测状态。前端据此渲染气泡终态与侧栏徽标。
-ThreadStatus = Literal["idle", "running", "done", "error", "cancelled"]
+ThreadStatus = Literal["idle", "running", "done", "error", "cancelled", "interrupted"]
 
 
 class ThreadMeta(BaseModel):
@@ -157,6 +167,7 @@ class ThreadDetail(BaseModel):
     papers: list[Paper] = Field(default_factory=list)
     report: str = ""
     evidence: list[EvidenceChunk] = Field(default_factory=list)
+    citation_check: dict[str, object] = Field(default_factory=dict)
     last_error: Optional[str] = None
 
 
@@ -222,8 +233,9 @@ class MessageRequest(BaseModel):
     base_url: Optional[str] = None
     model: Optional[str] = None
     provider: Optional[str] = None
-    max_search_rounds: Optional[int] = None
-    max_results_per_round: Optional[int] = None
+    # 运行期资源上限：避免客户端把单次任务放大成无界检索。
+    max_search_rounds: Optional[int] = Field(default=None, ge=1, le=10)
+    max_results_per_round: Optional[int] = Field(default=None, ge=1, le=100)
     providers: Optional[list[str]] = None
     openalex_mailto: Optional[str] = None
     crossref_mailto: Optional[str] = None

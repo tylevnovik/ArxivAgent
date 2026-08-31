@@ -40,8 +40,10 @@ def reset_thread_manager():
     """每个测试前清空运行期任务索引，避免跨测试污染。"""
     from core.threads import thread_manager
     thread_manager._tasks.clear()
+    thread_manager._deleted_ids.clear()
     yield
     thread_manager._tasks.clear()
+    thread_manager._deleted_ids.clear()
 
 
 @pytest.fixture(autouse=True)

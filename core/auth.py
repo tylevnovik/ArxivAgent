@@ -132,7 +132,7 @@ def unauthorized_response(detail: str = "未授权") -> JSONResponse:
 
 
 # 不需要认证的路径白名单。
-PUBLIC_PATHS = {"/api/health", "/api/system/deps", "/api/config/health", "/api/auth/status"}
+PUBLIC_PATHS = {"/api/health", "/api/system/deps", "/api/auth/status"}
 
 
 def is_public_path(path: str) -> bool:

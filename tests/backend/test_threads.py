@@ -1,6 +1,10 @@
 """线程 CRUD + 持久化。"""
 
-from core.threads import thread_manager
+import json
+
+import pytest
+
+from core.threads import THREAD_SCHEMA_VERSION, ThreadBusyError, ThreadManager, thread_manager
 
 
 def test_create_thread(client):
@@ -42,6 +46,86 @@ def test_rename_thread(client):
     assert r.json()["title"] == "new name"
     # 再读一次确认持久化
     assert client.get(f"/api/threads/{t['id']}").json()["title"] == "new name"
+
+
+def test_rename_running_thread_http_returns_409(client):
+    t = client.post("/api/threads", json={"title": "running"}).json()["thread"]
+    handle = thread_manager.start_task(t["id"])
+    try:
+        r = client.patch(f"/api/threads/{t['id']}", json={"title": "must wait"})
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "thread_busy"
+    finally:
+        handle.finished.set()
+        thread_manager.finish_task(t["id"], handle)
+
+
+def test_rename_running_thread_returns_conflict(isolated_data_dir):
+    thread = thread_manager.create(title="running")
+    handle = thread_manager.start_task(thread.id)
+    try:
+        with pytest.raises(ThreadBusyError):
+            thread_manager.rename(thread.id, "should not win")
+    finally:
+        handle.finished.set()
+        thread_manager.finish_task(thread.id, handle)
+
+
+def test_start_task_does_not_replace_existing_running_task(isolated_data_dir):
+    thread = thread_manager.create()
+    first = thread_manager.start_task(thread.id)
+    try:
+        with pytest.raises(ThreadBusyError):
+            thread_manager.start_task(thread.id)
+        assert thread_manager.get_task(thread.id) is first
+    finally:
+        first.finished.set()
+        thread_manager.finish_task(thread.id, first)
+
+
+def test_recover_running_and_migrate_legacy_thread(isolated_data_dir):
+    from config import THREADS_DIR
+
+    path = f"{THREADS_DIR}/legacy.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "id": "legacy",
+                "title": "旧线程",
+                "status": "running",
+                "created_at": "2026-01-01T00:00:00",
+                "updated_at": "2026-01-01T00:00:00",
+                "memory": {"history": [{"role": "user", "content": "旧问题"}]},
+            },
+            f,
+        )
+
+    manager = ThreadManager()
+    stats = manager.recover_interrupted()
+    recovered = manager.get("legacy")
+
+    assert stats["interrupted"] == 1
+    assert recovered is not None
+    assert recovered.status == "interrupted"
+    assert recovered.last_error
+    assert recovered.memory.conversation[0]["content"] == "旧问题"
+    with open(path, "r", encoding="utf-8") as f:
+        assert json.load(f)["schema_version"] == THREAD_SCHEMA_VERSION
+
+
+def test_corrupt_thread_is_quarantined(isolated_data_dir):
+    from config import THREADS_DIR
+
+    path = f"{THREADS_DIR}/broken.json"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("not-json")
+
+    manager = ThreadManager()
+    stats = manager.recover_interrupted()
+
+    assert stats["quarantined"] == 1
+    assert not manager.get("broken")
+    assert not __import__("os").path.exists(path)
 
 
 def test_delete_thread(client):

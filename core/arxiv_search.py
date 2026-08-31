@@ -7,7 +7,7 @@ import requests
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 import config
@@ -51,6 +51,8 @@ class SearchResult:
     papers: list[dict]
     error: Optional[SearchError] = None
     query_used: str = ""
+    # 多源检索时保留每个 provider 的结果，便于 UI 反馈部分失败。
+    provider_statuses: list[dict] = field(default_factory=list)
 
 
 def search(

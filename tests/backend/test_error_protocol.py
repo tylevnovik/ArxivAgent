@@ -77,3 +77,29 @@ def test_invalid_provider_among_valid_still_rejected(client):
     )
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_provider"
+
+
+def test_message_search_limits_are_bounded(client):
+    t = client.post("/api/threads", json={"title": None}).json()["thread"]
+    for field, value in (("max_search_rounds", 0), ("max_results_per_round", 101)):
+        r = client.post(
+            f"/api/threads/{t['id']}/messages",
+            json={"query": "test", "api_key": "sk-test", field: value},
+        )
+        assert r.status_code == 422
+
+
+def test_cors_allows_local_dev_origin_but_not_arbitrary_origin(client):
+    allowed = client.get(
+        "/api/health",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+    assert allowed.status_code == 200
+    assert allowed.headers.get("access-control-allow-origin") == "http://127.0.0.1:5173"
+
+    denied = client.get(
+        "/api/health",
+        headers={"Origin": "https://evil.example"},
+    )
+    assert denied.status_code == 200
+    assert "access-control-allow-origin" not in denied.headers

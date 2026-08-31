@@ -8,6 +8,7 @@ from core.search_service import (
     _append_filter,
     _extract_year_bounds,
     _paper_identity,
+    _merge_paper_records,
     _paper_score,
     _provider_query,
     _rank_and_dedupe,
@@ -54,6 +55,49 @@ class TestExtractYearBounds:
         # "2020 之后" 且文本里出现多个年份 → 取最小
         lo, hi = _extract_year_bounds("2021 和 2020 之后的研究")
         assert lo == 2020 and hi is None
+
+
+def test_rank_and_dedupe_merges_richer_cross_provider_record():
+    """同一论文来自多个源时，应保留后续源补充的 DOI/PDF/引用数。"""
+    papers = [
+        {
+            "title": "A Unified Retrieval System",
+            "authors": ["A"],
+            "abstract": "short",
+            "source": "arxiv",
+            "source_id": "2401.00001",
+            "arxiv_id": "2401.00001",
+            "doi": "",
+            "pdf_link": "",
+            "citation_count": 2,
+        },
+        {
+            "title": "A Unified Retrieval System",
+            "authors": ["A", "B"],
+            "abstract": "a much more complete abstract for the same work",
+            "source": "openalex",
+            "source_id": "https://openalex.org/W1",
+            "arxiv_id": "",
+            "doi": "10.1234/example",
+            "pdf_link": "https://example.org/paper.pdf",
+            "citation_count": 42,
+        },
+    ]
+
+    merged = _rank_and_dedupe(papers, "retrieval", 10)
+
+    assert len(merged) == 1
+    assert merged[0]["doi"] == "10.1234/example"
+    assert merged[0]["pdf_link"] == "https://example.org/paper.pdf"
+    assert merged[0]["citation_count"] == 42
+    assert merged[0]["sources"] == ["arxiv", "openalex"]
+    assert merged[0]["source_ids"] == {"arxiv": "2401.00001", "openalex": "https://openalex.org/W1"}
+
+
+def test_merge_initial_record_normalizes_source_metadata():
+    merged = _merge_paper_records(None, {"title": "x", "source": "crossref", "source_id": "doi-1"})
+    assert merged["sources"] == ["crossref"]
+    assert merged["source_ids"] == {"crossref": "doi-1"}
 
 
 # ===================== _simplify_arxiv_query =====================
@@ -199,12 +243,22 @@ class TestPaperIdentity:
 
 
 def test_tokens_filters_short():
-    # search_service._tokens 只匹配 [a-zA-Z0-9]+，长度 <= 2 的被丢弃，中文不匹配
-    # （中文分词用 rag.py 的 tokenize，不是这里）
+    # 英文/数字仍过滤过短 token，同时保留可用于中文检索的 CJK token。
     result = _tokens("a ab abc 12 123 中文")
     assert "a" not in result and "ab" not in result
     assert "abc" in result and "123" in result
-    assert "中文" not in result  # 中文不在 _tokens 处理范围
+    assert "中文" in result
+
+
+def test_chinese_title_without_external_id_is_ranked_and_deduped():
+    papers = [
+        _paper(title="无关主题的研究"),
+        _paper(title="深度学习在论文检索中的应用", abstract="中文论文检索与深度学习"),
+        _paper(title="深度学习在论文检索中的应用！"),
+    ]
+    result = _rank_and_dedupe(papers, "深度学习 论文检索", 10)
+    assert len(result) == 2
+    assert result[0]["title"].startswith("深度学习")
 
 
 def test_append_filter():

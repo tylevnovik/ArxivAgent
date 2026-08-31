@@ -151,8 +151,8 @@ class TestPublicPaths:
     def test_system_deps_is_public(self):
         assert is_public_path("/api/system/deps") is True
 
-    def test_config_health_is_public(self):
-        assert is_public_path("/api/config/health") is True
+    def test_config_health_is_protected(self):
+        assert is_public_path("/api/config/health") is False
 
     def test_threads_is_protected(self):
         assert is_public_path("/api/threads") is False
@@ -200,6 +200,14 @@ class TestAuthMiddleware:
         assert r.status_code == 200
         r = c.get("/api/system/deps")
         assert r.status_code == 200
+
+    def test_config_health_requires_auth(self, auth_client):
+        c, secret, token = auth_client
+        assert c.get("/api/config/health").status_code == 401
+        headers = {"Authorization": self._make_header(
+            secret, token, "GET", "/api/config/health",
+        )}
+        assert c.get("/api/config/health", headers=headers).status_code == 200
 
     def test_protected_endpoint_rejects_without_auth(self, auth_client):
         c, _, _ = auth_client

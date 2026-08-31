@@ -4,6 +4,8 @@ PDF 下载与解析模块
 import os
 import re
 import hashlib
+import tempfile
+import threading
 import requests
 import pypdf
 import config
@@ -15,6 +17,14 @@ HEADERS = {
 
 # 单篇 PDF 下载大小上限（字节）。超过则中止下载，避免恶意/错误链接撑爆磁盘。
 MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
+
+_DOWNLOAD_LOCK_GUARD = threading.Lock()
+_DOWNLOAD_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _download_lock(arxiv_id: str) -> threading.Lock:
+    with _DOWNLOAD_LOCK_GUARD:
+        return _DOWNLOAD_LOCKS.setdefault(arxiv_id, threading.Lock())
 
 
 def get_arxiv_id(pdf_link: str) -> str:
@@ -45,46 +55,61 @@ def download_pdf(pdf_link: str, arxiv_id: str) -> str:
     filename = f"{arxiv_id}.pdf"
     filepath = os.path.join(config.PDF_CACHE_DIR, filename)
 
-    if os.path.exists(filepath) and os.path.getsize(filepath) > 1000:
-        return filepath
+    with _download_lock(arxiv_id):
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 1000:
+            return filepath
 
-    try:
-        # stream=True 逐块下载，避免一次性把整个 PDF 读进内存
-        with requests.get(pdf_link, headers=HEADERS, timeout=30, stream=True) as response:
-            response.raise_for_status()
-            written = 0
-            with open(filepath, "wb") as f:
-                for chunk in response.iter_content(chunk_size=64 * 1024):
-                    if not chunk:
-                        continue
-                    written += len(chunk)
-                    if written > MAX_PDF_BYTES:
-                        raise RuntimeError(
-                            f"PDF 超过大小上限 {MAX_PDF_BYTES // (1024 * 1024)}MB "
-                            f"({pdf_link})"
-                        )
-                    f.write(chunk)
-        return filepath
-    except Exception as e:
-        # 下载失败或超限时清理半成品文件，避免后续误判为已缓存
-        if os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-            except OSError:
-                pass
-        raise RuntimeError(f"下载 PDF 失败 ({pdf_link}): {e}")
+        tmp = ""
+        try:
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                prefix=f".{arxiv_id}.", suffix=".pdf.tmp", dir=config.PDF_CACHE_DIR
+            )
+            # stream=True 逐块下载，避免一次性把整个 PDF 读进内存。
+            with os.fdopen(fd, "wb") as f:
+                with requests.get(pdf_link, headers=HEADERS, timeout=30, stream=True) as response:
+                    response.raise_for_status()
+                    written = 0
+                    for chunk in response.iter_content(chunk_size=64 * 1024):
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        if written > MAX_PDF_BYTES:
+                            raise RuntimeError(
+                                f"PDF 超过大小上限 {MAX_PDF_BYTES // (1024 * 1024)}MB "
+                                f"({pdf_link})"
+                            )
+                        f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, filepath)
+            tmp = ""
+            return filepath
+        except Exception as e:
+            raise RuntimeError(f"下载 PDF 失败 ({pdf_link}): {e}")
+        finally:
+            if tmp and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
 
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """使用 pypdf 从本地 PDF 文件提取完整文本"""
+    return "\n\n".join(text for _, text in _extract_pages_from_pdf(pdf_path) if text)
+
+
+def _extract_pages_from_pdf(pdf_path: str) -> list[tuple[int, str]]:
+    """按页提取文本，页码从 1 开始，供证据回溯使用。"""
     try:
         reader = pypdf.PdfReader(pdf_path)
-        text_parts = []
-        for page in reader.pages:
+        pages = []
+        for page_number, page in enumerate(reader.pages, start=1):
             t = page.extract_text()
             if t:
-                text_parts.append(t)
-        return "\n\n".join(text_parts)
+                pages.append((page_number, t))
+        return pages
     except Exception as e:
         raise RuntimeError(f"解析 PDF 失败 ({pdf_path}): {e}")
 
@@ -144,18 +169,45 @@ def process_paper_pdf(title: str, pdf_link: str) -> list[dict]:
     arxiv_id = get_arxiv_id(pdf_link)
     try:
         pdf_path = download_pdf(pdf_link, arxiv_id)
-        full_text = extract_text_from_pdf(pdf_path)
-        text_chunks = chunk_text(full_text)
-        
+        pages = _extract_pages_from_pdf(pdf_path)
         chunks = []
-        for i, text in enumerate(text_chunks):
-            chunks.append({
-                "paper_title": title,
-                "arxiv_id": arxiv_id,
-                "chunk_index": i,
-                "text": text.strip()
-            })
+        source_url = _source_url_from_pdf(pdf_link, arxiv_id)
+        for page_number, page_text in pages:
+            for text in chunk_text(page_text):
+                chunks.append({
+                    "paper_title": title,
+                    "arxiv_id": arxiv_id,
+                    "chunk_index": len(chunks),
+                    "page_number": page_number,
+                    "page_end": page_number,
+                    "section_title": _detect_section_title(text),
+                    "source_url": source_url,
+                    "pdf_url": pdf_link,
+                    "text": text.strip(),
+                })
         return chunks
     except Exception as e:
         print(f"[WARN] Failed to process paper PDF: {title} ({pdf_link}) - {e}")
         return []
+
+
+def _detect_section_title(text: str) -> str:
+    """从分块开头保守识别章节标题；识别不到时返回空字符串。"""
+    for raw_line in str(text or "").splitlines()[:8]:
+        line = re.sub(r"\s+", " ", raw_line).strip(" -\t")
+        if not 2 <= len(line) <= 120 or line.endswith((".", "。", ":", "：")):
+            continue
+        if re.match(r"^(?:\d+(?:\.\d+)*[.)]?|[IVX]+)\s+\S+", line, re.IGNORECASE):
+            return line
+        if line.isupper() and len(line.split()) <= 12:
+            return line
+        if re.fullmatch(r"[\u3400-\u9fffA-Za-z0-9 ()（）\-]{2,80}", line):
+            return line
+    return ""
+
+
+def _source_url_from_pdf(pdf_link: str, arxiv_id: str) -> str:
+    match = re.search(r"(https?://[^/]+)/(?:pdf|abs)/", pdf_link or "", re.IGNORECASE)
+    if match and arxiv_id and not arxiv_id == "unknown":
+        return f"{match.group(1)}/abs/{arxiv_id}"
+    return pdf_link or ""

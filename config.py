@@ -14,8 +14,12 @@ APP_VERSION = "0.4.0"
 
 # DeepSeek API 配置
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_BASE_URL = os.environ.get(
+    "DEEPSEEK_BASE_URL", "https://api.deepseek.com"
+).strip() or "https://api.deepseek.com"
+DEEPSEEK_MODEL = os.environ.get(
+    "DEEPSEEK_MODEL", "deepseek-v4-flash"
+).strip() or "deepseek-v4-flash"
 
 # arXiv API 配置
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
@@ -29,6 +33,8 @@ SEARCH_PROVIDERS = [
 ]
 SEARCH_PROVIDER_TIMEOUT_SECONDS = float(os.environ.get("SEARCH_PROVIDER_TIMEOUT_SECONDS", "15"))
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
+SEARCH_CACHE_MAX_BYTES = int(os.environ.get("SEARCH_CACHE_MAX_BYTES", str(256 * 1024 * 1024)))
+SEARCH_CACHE_MAX_FILES = int(os.environ.get("SEARCH_CACHE_MAX_FILES", "500"))
 OPENALEX_MAILTO = os.environ.get("OPENALEX_MAILTO", "")
 CROSSREF_MAILTO = os.environ.get("CROSSREF_MAILTO", "")
 SEMANTIC_SCHOLAR_API_KEY = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "")

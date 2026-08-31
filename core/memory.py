@@ -15,6 +15,7 @@ class SearchRound:
     results: list[dict]     # 原始检索结果
     review: dict            # LLM 审核结果
     relevant_papers: list[dict]  # 筛选出的相关论文
+    provider_statuses: list[dict] = field(default_factory=list)
     timestamp: str = ""
 
     def __post_init__(self):
@@ -30,6 +31,7 @@ class SearchRound:
             "results": self.results,
             "review": self.review,
             "relevant_papers": self.relevant_papers,
+            "provider_statuses": self.provider_statuses,
             "timestamp": self.timestamp,
         }
 
@@ -43,6 +45,7 @@ class SearchRound:
             results=list(data.get("results", []) or []),
             review=dict(data.get("review", {}) or {}),
             relevant_papers=list(data.get("relevant_papers", []) or []),
+            provider_statuses=list(data.get("provider_statuses", []) or []),
             timestamp=str(data.get("timestamp", "") or ""),
         )
 
@@ -59,6 +62,12 @@ class Memory:
         self.evidence_chunks: list[dict] = []  # 报告引用的正文证据切片（RAG 命中）
         # 检索式变体（LLM 产出的 keywords / arxiv_query），供 RAG 多查询检索复用
         self.rag_query_variants: list[str] = []
+        self.citation_check: dict = {
+            "total": 0,
+            "matched": 0,
+            "unmatched": [],
+            "all_matched": True,
+        }
     
     def set_user_query(self, query: str):
         """设置用户原始需求"""
@@ -73,7 +82,8 @@ class Memory:
         })
     
     def add_search_round(self, query: str, strategy: str, results: list[dict],
-                         review: dict, relevant_papers: list[dict]):
+                         review: dict, relevant_papers: list[dict],
+                         provider_statuses: list[dict] = None):
         """添加一轮检索记录"""
         round_num = len(self.search_rounds) + 1
         search_round = SearchRound(
@@ -83,6 +93,7 @@ class Memory:
             results=results,
             review=review,
             relevant_papers=relevant_papers,
+            provider_statuses=list(provider_statuses or []),
         )
         self.search_rounds.append(search_round)
         return search_round
@@ -139,6 +150,7 @@ class Memory:
                     "strategy": sr.strategy,
                     "results_count": len(sr.results),
                     "relevant_papers_count": len(sr.relevant_papers),
+                    "provider_statuses": sr.provider_statuses,
                     "review_summary": sr.review.get("review_summary", ""),
                     "overall_quality": sr.review.get("overall_quality", 0),
                     "timestamp": sr.timestamp,
@@ -162,6 +174,7 @@ class Memory:
             "final_report": self.final_report,
             "evidence_chunks": self.evidence_chunks,
             "rag_query_variants": self.rag_query_variants,
+            "citation_check": self.citation_check,
         }
 
     @classmethod
@@ -182,6 +195,7 @@ class Memory:
         mem.rag_query_variants = [
             str(v) for v in (data.get("rag_query_variants") or [])
         ]
+        mem.citation_check = dict(data.get("citation_check", {}) or mem.citation_check)
         return mem
 
     def reset(self):

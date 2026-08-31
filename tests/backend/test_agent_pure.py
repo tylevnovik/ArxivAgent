@@ -13,6 +13,8 @@ from core.agent import (
     _coerce_int,
     _normalize_title,
     _select_relevant_papers,
+    _format_rag_context,
+    validate_report_citations,
 )
 
 
@@ -92,6 +94,42 @@ def test_normalize_title():
     assert _normalize_title("  Graph   Neural ") == "graph neural"
     assert _normalize_title(None) == ""
     assert _normalize_title(123) == "123"
+
+
+def test_rag_context_exposes_page_and_section_metadata():
+    rendered = _format_rag_context([{
+        "paper_title": "Evidence Paper",
+        "chunk_index": 4,
+        "page_number": 7,
+        "page_end": 8,
+        "section_title": "3. Experiments",
+        "retrieval_sources": ["dense"],
+        "text": "evidence",
+    }])
+    assert "【正文: Evidence Paper | 分块 4】" in rendered
+    assert "页码=7-8" in rendered
+    assert "章节=3. Experiments" in rendered
+
+
+def test_report_citation_check_distinguishes_real_and_unmatched_chunks():
+    evidence = [{"paper_title": "Evidence Paper", "chunk_index": 4}]
+    result = validate_report_citations(
+        "真实【正文: Evidence Paper | 分块 4】伪造【正文: Other Paper | 分块 9】",
+        evidence,
+    )
+    assert result == {
+        "total": 2,
+        "matched": 1,
+        "unmatched": [{"paper_title": "Other Paper", "chunk_index": "9"}],
+        "all_matched": False,
+    }
+
+
+def test_report_citation_check_does_not_match_empty_evidence_title():
+    result = validate_report_citations(
+        "【正文: Anything | 分块 1】", [{"paper_title": "", "chunk_index": 1}]
+    )
+    assert result["all_matched"] is False
 
 
 # ===================== _select_relevant_papers =====================

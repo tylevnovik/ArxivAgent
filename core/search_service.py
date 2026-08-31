@@ -11,7 +11,10 @@ import json
 import math
 import os
 import re
+import tempfile
+import threading
 import time
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +25,16 @@ import requests
 import config
 from core import arxiv_search
 from core.arxiv_search import SearchError, SearchErrorType, SearchResult
+
+
+_CACHE_LOCK_GUARD = threading.Lock()
+_CACHE_LOCKS: dict[str, threading.Lock] = {}
+_CACHE_PRUNE_LOCK = threading.Lock()
+
+
+def _cache_lock(cache_key: str) -> threading.Lock:
+    with _CACHE_LOCK_GUARD:
+        return _CACHE_LOCKS.setdefault(cache_key, threading.Lock())
 
 
 @dataclass
@@ -386,6 +399,7 @@ class SearchService:
     ):
         provider_names = providers if providers else config.SEARCH_PROVIDERS
         self.provider_settings = provider_settings or {}
+        self._last_cache_provider_statuses: list[dict] = []
         self.providers = [
             _make_provider(name, self.provider_settings)
             for name in provider_names
@@ -406,7 +420,12 @@ class SearchService:
         cache_key = self._cache_key(arxiv_query, natural_query, max_results, sort_by)
         cached = self._read_cache(cache_key)
         if cached is not None:
-            return SearchResult(success=True, papers=cached, query_used=arxiv_query)
+            provider_statuses = self._last_cache_provider_statuses or [
+                {"source": name, "ok": True, "paper_count": len(cached), "cached": True}
+                for name in [provider.name for provider in self.providers]
+            ]
+            return SearchResult(success=True, papers=cached, query_used=arxiv_query,
+                                provider_statuses=provider_statuses)
 
         outcomes: list[ProviderOutcome] = []
         papers: list[dict] = []
@@ -427,9 +446,11 @@ class SearchService:
             papers.extend(outcome.papers)
 
         ranked = _rank_and_dedupe(papers, natural_query, max_results)
+        provider_statuses = [_provider_status(outcome) for outcome in outcomes]
         if ranked:
-            self._write_cache(cache_key, ranked)
-            return SearchResult(success=True, papers=ranked, query_used=arxiv_query)
+            self._write_cache(cache_key, ranked, provider_statuses)
+            return SearchResult(success=True, papers=ranked, query_used=arxiv_query,
+                                provider_statuses=provider_statuses)
 
         errors = [outcome.error for outcome in outcomes if outcome.error]
         if errors:
@@ -438,6 +459,7 @@ class SearchService:
                 papers=[],
                 error=_merge_errors(errors),
                 query_used=arxiv_query,
+                provider_statuses=provider_statuses,
             )
 
         return SearchResult(
@@ -449,6 +471,7 @@ class SearchService:
                 recoverable=True,
             ),
             query_used=arxiv_query,
+            provider_statuses=provider_statuses,
         )
 
     def provider_labels(self) -> str:
@@ -462,7 +485,7 @@ class SearchService:
         sort_by: str,
     ) -> str:
         payload = {
-            "cache_version": 7,
+            "cache_version": 8,
             "providers": [provider.name for provider in self.providers],
             "semantic_scholar_api_enabled": bool(
                 self.provider_settings.get("semantic_scholar_api_key")
@@ -483,31 +506,104 @@ class SearchService:
         if config.SEARCH_CACHE_TTL_SECONDS <= 0:
             return None
         path = self._cache_path(cache_key)
-        if not os.path.exists(path):
-            return None
-        age = time.time() - os.path.getmtime(path)
-        if age > config.SEARCH_CACHE_TTL_SECONDS:
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            papers = data.get("papers", [])
-            for paper in papers:
-                paper["from_cache"] = True
-            return papers
-        except (OSError, ValueError, TypeError):
-            return None
+        with _cache_lock(cache_key):
+            if not os.path.exists(path):
+                return None
+            try:
+                age = time.time() - os.path.getmtime(path)
+                if age > config.SEARCH_CACHE_TTL_SECONDS:
+                    return None
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                papers = data.get("papers", [])
+                if not isinstance(papers, list):
+                    raise ValueError("缓存 papers 不是数组")
+                statuses = data.get("provider_statuses", [])
+                self._last_cache_provider_statuses = (
+                    [dict(item) for item in statuses if isinstance(item, dict)]
+                    if isinstance(statuses, list) else []
+                )
+                for paper in papers:
+                    if isinstance(paper, dict):
+                        paper["from_cache"] = True
+                return papers
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                self._quarantine_cache(path, str(exc))
+                return None
 
-    def _write_cache(self, cache_key: str, papers: list[dict]):
+    def _write_cache(
+        self,
+        cache_key: str,
+        papers: list[dict],
+        provider_statuses: Optional[list[dict]] = None,
+    ):
         if config.SEARCH_CACHE_TTL_SECONDS <= 0:
             return
         payload = {
             "created_at": datetime.now().isoformat(),
             "papers": papers,
+            "provider_statuses": list(provider_statuses or []),
         }
+        path = self._cache_path(cache_key)
+        with _cache_lock(cache_key):
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                fd, tmp = tempfile.mkstemp(
+                    prefix=f".{cache_key}.", suffix=".tmp", dir=os.path.dirname(path)
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                finally:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+            except OSError:
+                return
+        self._prune_cache()
+
+    @staticmethod
+    def _quarantine_cache(path: str, reason: str = "") -> None:
+        if not os.path.exists(path):
+            return
         try:
-            with open(self._cache_path(cache_key), "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+            destination = path + f".{int(time.time() * 1000000)}.bad"
+            os.replace(path, destination)
+            if reason:
+                with open(destination + ".reason", "w", encoding="utf-8") as f:
+                    f.write(reason[:500])
+        except OSError:
+            pass
+
+    @staticmethod
+    def _prune_cache() -> None:
+        """按最旧优先清理搜索缓存，避免长期运行无限增长。"""
+        directory = config.SEARCH_CACHE_DIR
+        max_bytes = max(0, int(getattr(config, "SEARCH_CACHE_MAX_BYTES", 256 * 1024 * 1024)))
+        max_files = max(0, int(getattr(config, "SEARCH_CACHE_MAX_FILES", 500)))
+        try:
+            with _CACHE_PRUNE_LOCK:
+                entries = []
+                for name in os.listdir(directory):
+                    if not name.endswith(".json"):
+                        continue
+                    path = os.path.join(directory, name)
+                    try:
+                        stat = os.stat(path)
+                    except OSError:
+                        continue
+                    entries.append((stat.st_mtime, stat.st_size, path))
+                entries.sort(key=lambda item: item[0])
+                total = sum(size for _, size, _ in entries)
+                while entries and (len(entries) > max_files or total > max_bytes):
+                    _, size, path = entries.pop(0)
+                    try:
+                        os.remove(path)
+                        total -= size
+                    except OSError:
+                        continue
         except OSError:
             pass
 
@@ -542,6 +638,10 @@ def _with_source(paper: dict, source: str) -> dict:
     normalized.setdefault("doi", "")
     normalized.setdefault("citation_count", 0)
     normalized.setdefault("score", 0.0)
+    sources = list(normalized.get("sources", []) or [])
+    if source not in sources:
+        sources.append(source)
+    normalized["sources"] = sources
     return normalized
 
 
@@ -746,30 +846,125 @@ def _strip_doi_prefix(doi: str) -> str:
 
 
 def _rank_and_dedupe(papers: list[dict], query: str, max_results: int) -> list[dict]:
-    seen = set()
-    deduped = []
+    aliases: dict[str, str] = {}
+    deduped: dict[str, dict] = {}
     query_terms = set(_tokens(query))
     for paper in papers:
-        identity = _paper_identity(paper)
-        if not identity or identity in seen:
+        keys = _paper_identity_keys(paper)
+        matching = {aliases[key] for key in keys if key in aliases}
+        if not keys and not matching:
             continue
-        seen.add(identity)
+        identity = next(iter(matching), next(iter(keys), ""))
+        if not identity:
+            continue
+        if len(matching) > 1:
+            # 一个记录同时命中 DOI/arXiv/title 别名时合并索引，避免后续重复。
+            identity = sorted(matching)[0]
+            for other in matching - {identity}:
+                deduped[identity] = _merge_paper_records(deduped[identity], deduped.pop(other))
+                for alias, owner in list(aliases.items()):
+                    if owner == other:
+                        aliases[alias] = identity
+        existing = deduped.get(identity)
+        deduped[identity] = _merge_paper_records(existing, paper)
+        for key in keys:
+            aliases[key] = identity
+
+    ranked = []
+    for paper in deduped.values():
         paper = paper.copy()
         paper["score"] = _paper_score(paper, query_terms)
-        deduped.append(paper)
-    deduped.sort(key=lambda item: item.get("score", 0.0), reverse=True)
-    return deduped[:max_results]
+        ranked.append(paper)
+    ranked.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return ranked[:max_results]
 
 
 def _paper_identity(paper: dict) -> str:
-    doi = _strip_doi_prefix(paper.get("doi", "")).lower()
+    keys = _paper_identity_keys(paper)
+    return keys[0] if keys else ""
+
+
+def _paper_identity_keys(paper: dict) -> list[str]:
+    """返回可跨 provider 对齐的身份别名，强身份排在前面。"""
+    keys: list[str] = []
+    doi = _strip_doi_prefix(paper.get("doi", "")).casefold().strip()
     if doi:
-        return f"doi:{doi}"
-    arxiv_id = paper.get("arxiv_id", "").lower()
+        keys.append(f"doi:{doi}")
+    arxiv_id = str(paper.get("arxiv_id", "") or "").strip().casefold()
     if arxiv_id:
-        return f"arxiv:{arxiv_id}"
-    title = re.sub(r"[^a-z0-9]+", " ", paper.get("title", "").lower()).strip()
-    return f"title:{title}" if title else ""
+        keys.append(f"arxiv:{arxiv_id}")
+    title = _normalize_search_text(paper.get("title", ""))
+    title = re.sub(r"[^\w\u3400-\u9fff]+", " ", title, flags=re.UNICODE)
+    title = re.sub(r"\s+", " ", title).strip()
+    if title:
+        keys.append(f"title:{title}")
+    source_id = str(paper.get("source_id", "") or "").strip().casefold()
+    if source_id:
+        keys.append(f"source:{source_id}")
+    return keys
+
+
+def _merge_paper_records(existing: Optional[dict], incoming: dict) -> dict:
+    """合并同一论文的多源字段，保留更完整的身份、链接和引用数。"""
+    if existing is None:
+        merged = incoming.copy()
+        merged.setdefault("authors", list(incoming.get("authors", []) or []))
+        merged.setdefault("categories", list(incoming.get("categories", []) or []))
+        merged.setdefault("abstract", "")
+        merged.setdefault("link", "")
+        merged.setdefault("pdf_link", "")
+        merged.setdefault("published", "")
+        merged.setdefault("updated", "")
+        merged.setdefault("arxiv_id", "")
+        merged.setdefault("doi", "")
+        merged.setdefault("citation_count", 0)
+        source = str(merged.get("source", "") or "")
+        merged["sources"] = list(dict.fromkeys(
+            [*(merged.get("sources", []) or []), source] if source else (merged.get("sources", []) or [])
+        ))
+        source_id = str(merged.get("source_id", "") or "")
+        if source and source_id:
+            merged["source_ids"] = {source: source_id}
+        return merged
+    merged = existing.copy()
+    for field_name in ("title", "abstract", "link", "pdf_link", "published", "updated", "arxiv_id", "doi"):
+        old = str(merged.get(field_name, "") or "").strip()
+        new = str(incoming.get(field_name, "") or "").strip()
+        if not old or (field_name == "abstract" and len(new) > len(old)):
+            if new:
+                merged[field_name] = new
+    if len(incoming.get("authors", []) or []) > len(merged.get("authors", []) or []):
+        merged["authors"] = list(incoming.get("authors", []) or [])
+    if len(incoming.get("categories", []) or []) > len(merged.get("categories", []) or []):
+        merged["categories"] = list(incoming.get("categories", []) or [])
+    merged["citation_count"] = max(
+        int(merged.get("citation_count", 0) or 0),
+        int(incoming.get("citation_count", 0) or 0),
+    )
+    sources = list(merged.get("sources", []) or [])
+    sources.extend(incoming.get("sources", []) or [incoming.get("source", "")])
+    merged["sources"] = list(dict.fromkeys(s for s in sources if s))
+    source_ids = dict(merged.get("source_ids", {}) or {})
+    for record in (merged, incoming):
+        source = str(record.get("source", "") or "")
+        source_id = str(record.get("source_id", "") or "")
+        if source and source_id:
+            source_ids[source] = source_id
+    if source_ids:
+        merged["source_ids"] = source_ids
+    return merged
+
+
+def _provider_status(outcome: ProviderOutcome) -> dict:
+    error = outcome.error
+    return {
+        "source": outcome.source,
+        "ok": error is None,
+        "paper_count": len(outcome.papers),
+        "cached": bool(outcome.cached),
+        "error_type": error.error_type.value if error else "",
+        "error": error.message if error else "",
+    }
 
 
 def _paper_score(paper: dict, query_terms: set[str]) -> float:
@@ -784,11 +979,21 @@ def _paper_score(paper: dict, query_terms: set[str]) -> float:
 
 
 def _tokens(text: str) -> list[str]:
-    return [
-        token.lower()
-        for token in re.findall(r"[a-zA-Z0-9]+", text or "")
-        if len(token) > 2
-    ]
+    normalized = _normalize_search_text(text)
+    tokens: list[str] = []
+    for chunk in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE):
+        if re.fullmatch(r"[\u3400-\u9fff]+", chunk):
+            # CJK 没有空格分词：保留单字和相邻二字片段，兼顾短查询与短标题。
+            tokens.extend(chunk)
+            tokens.extend(chunk[i:i + 2] for i in range(len(chunk) - 1))
+        elif len(chunk) > 2:
+            tokens.append(chunk)
+    return tokens
+
+
+def _normalize_search_text(text: str) -> str:
+    """统一全角/大小写，使英文和中文标题走同一套匹配与去重规则。"""
+    return unicodedata.normalize("NFKC", str(text or "")).casefold()
 
 
 def _merge_errors(errors: list[SearchError]) -> SearchError:
