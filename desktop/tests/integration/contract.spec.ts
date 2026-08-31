@@ -7,7 +7,7 @@
  * 这覆盖了"前端契约消费者 ↔ 后端契约"的真实闭环，
  * 而无需 Playwright + Electron 的重型启动。
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
@@ -56,11 +56,11 @@ async function waitPortDown() {
 describe("frontend contract against mock backend", () => {
 	let backend: ChildProcess | null = null;
 
-	beforeEach(async () => {
+	beforeAll(async () => {
 		backend = await startMockBackend();
 	});
 
-	afterEach(async () => {
+	afterAll(async () => {
 		if (backend) {
 			backend.kill("SIGKILL");
 			backend = null;
@@ -93,6 +93,59 @@ describe("frontend contract against mock backend", () => {
 		expect(state.papers.length).toBeGreaterThanOrEqual(1);
 		expect(state.papers[0].title).toBe("Attention Is All You Need");
 		expect(state.report).toContain("检索报告");
+		expect(state.citation_check?.all_matched).toBe(true);
+	});
+
+	it("allows a keyless local provider and preserves structured citation metadata", async () => {
+		const { createThread, streamThreadMessage, applyEvent } = await importIntegration();
+		const meta = await createThread("local");
+		let state = await loadDetailForTest(meta.id);
+
+		await streamThreadMessage(meta.id, { query: "local model", provider: "ollama" }, (env) => {
+			state = applyEvent(state, env);
+		});
+
+		expect(state.status).toBe("done");
+		expect(state.evidence[0]?.page_number).toBe(2);
+		expect(state.evidence[0]?.section_title).toBe("1. Introduction");
+		expect(state.evidence[0]?.source_url).toContain("arxiv.org/abs");
+	});
+
+	it("supports rename, export, and delete through the frontend API contract", async () => {
+		const api = await importIntegration();
+		const meta = await api.createThread("before");
+		const renamed = await api.renameThread(meta.id, "after");
+		expect(renamed.title).toBe("after");
+
+		await api.streamThreadMessage(
+			meta.id,
+			{ query: "export me", api_key: "sk-test" },
+			() => {},
+		);
+		const exported = await api.exportThread(meta.id, "report");
+		expect(exported.filename).toMatch(/^mock_report_/);
+		await api.deleteThread(meta.id);
+		await expect(api.getThread(meta.id)).rejects.toThrow();
+	});
+
+	it("surfaces configuration failure and accepts a corrected endpoint", async () => {
+		const api = await importIntegration();
+		const bad = await api.getConfigHealth({
+			provider: "custom",
+			base_url: "javascript:alert(1)",
+			model: "local-model",
+			ping_llm: false,
+		});
+		expect(bad.ok).toBe(false);
+		expect(bad.llm_detail).toContain("无效");
+
+		const good = await api.getConfigHealth({
+			provider: "custom",
+			base_url: "http://localhost:9000/v1",
+			model: "local-model",
+			ping_llm: false,
+		});
+		expect(good.ok).toBe(true);
 	});
 });
 
@@ -104,6 +157,11 @@ async function importIntegration() {
 	return {
 		createThread: api.createThread,
 		streamThreadMessage: api.streamThreadMessage,
+		renameThread: api.renameThread,
+		exportThread: api.exportThread,
+		deleteThread: api.deleteThread,
+		getThread: api.getThread,
+		getConfigHealth: api.getConfigHealth,
 		applyEvent: reducer.applyEvent,
 		withUserMessage: reducer.withUserMessage,
 	};

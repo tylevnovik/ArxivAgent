@@ -99,14 +99,20 @@ import {
   waitForBackend,
 } from "./api";
 import { applyEvent, deriveProgress, withUserMessage, type SearchProgress } from "./eventReducer";
-import { clearApiKey, hasSecretsBridge, loadApiKey, loadSecret, saveApiKey, saveSecret } from "./secrets";
+import {
+  clearProviderApiKey,
+  hasSecretsBridge,
+  loadProviderApiKey,
+  loadSecret,
+  saveProviderApiKey,
+  saveSecret,
+} from "./secrets";
 import { renderMarkdown } from "./markdown";
 import { extractCitations, matchEvidence, type CitationRef } from "./citations-core";
 import { SetupWizard } from "./SetupWizard";
-import { PROVIDER_PRESETS, getPreset } from "./providers";
+import { PROVIDER_PRESETS, getPreset, getProviderRequestOverrides } from "./providers";
 
 const DEFAULT_PROVIDER = "deepseek";
-const DEFAULT_ENDPOINT = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-v4-flash";
 
 const suggestionPrompts = [
@@ -142,7 +148,8 @@ const STATUS_LABEL: Record<ThreadStatus, string> = {
   running: "检索中",
   done: "完成",
   error: "出错",
-  cancelled: "已取消",
+  cancelled: "已停止当前检索",
+  interrupted: "已中断",
 };
 
 function App() {
@@ -179,24 +186,28 @@ function App() {
   });
 
   // ---------- 配置（localStorage 存非敏感字段；API Key 走 secrets） ----------
-  const [config, setConfig] = useState<AppConfig>(() => ({
-    provider: localStorage.getItem("arxiv_agent_provider") || DEFAULT_PROVIDER,
-    endpoint: localStorage.getItem("arxiv_agent_endpoint") || DEFAULT_ENDPOINT,
-    apiKey: "",
-    modelName: localStorage.getItem("arxiv_agent_model_name") || DEFAULT_MODEL,
-    maxSearchRounds: parseInt(localStorage.getItem("arxiv_agent_max_search_rounds") || "3", 10),
-    maxResultsPerRound: parseInt(
-      localStorage.getItem("arxiv_agent_max_results_per_round") || "10",
-      10,
-    ),
-    providers: (localStorage.getItem("arxiv_agent_providers") || "arxiv,openalex,crossref").split(
-      ",",
-    ),
-    openalexMailto: localStorage.getItem("arxiv_agent_openalex_mailto") || "",
-    crossrefMailto: localStorage.getItem("arxiv_agent_crossref_mailto") || "",
-    // Semantic Scholar key 是敏感字段，走 secrets bridge（异步加载，初始空）
-    semanticScholarApiKey: "",
-  }));
+  const [config, setConfig] = useState<AppConfig>(() => {
+    const provider = localStorage.getItem("arxiv_agent_provider") || DEFAULT_PROVIDER;
+    const preset = getPreset(provider);
+    return {
+      provider,
+      endpoint: localStorage.getItem("arxiv_agent_endpoint") || preset.endpoint,
+      apiKey: "",
+      modelName: localStorage.getItem("arxiv_agent_model_name") || preset.defaultModel,
+      maxSearchRounds: parseInt(localStorage.getItem("arxiv_agent_max_search_rounds") || "3", 10),
+      maxResultsPerRound: parseInt(
+        localStorage.getItem("arxiv_agent_max_results_per_round") || "10",
+        10,
+      ),
+      providers: (localStorage.getItem("arxiv_agent_providers") || "arxiv,openalex,crossref").split(
+        ",",
+      ),
+      openalexMailto: localStorage.getItem("arxiv_agent_openalex_mailto") || "",
+      crossrefMailto: localStorage.getItem("arxiv_agent_crossref_mailto") || "",
+      // Semantic Scholar key 是敏感字段，走 secrets bridge（异步加载，初始空）
+      semanticScholarApiKey: "",
+    };
+  });
   const [apiKeyReady, setApiKeyReady] = useState(false);
   const [setupOpen, setSetupOpen] = useState(false);
   const [systemHealth, setSystemHealth] = useState<ConfigHealth | null>(null);
@@ -254,8 +265,12 @@ function App() {
     (async () => {
       let key = "";
       let semanticScholarApiKey = "";
+      const startupProvider = localStorage.getItem("arxiv_agent_provider") || DEFAULT_PROVIDER;
       try {
-        [key, semanticScholarApiKey] = await Promise.all([loadApiKey(), loadSecret("semantic_scholar_api_key")]);
+        [key, semanticScholarApiKey] = await Promise.all([
+          loadProviderApiKey(startupProvider),
+          loadSecret("semantic_scholar_api_key"),
+        ]);
       } catch (err) {
         console.warn("加载 API Key 失败", err);
       }
@@ -277,7 +292,10 @@ function App() {
 
       setApiKeyReady(true);
       // 未配置过 Key（secrets 与 has_api_key 标志都无）→ 开引导
-      const configured = Boolean(key) || localStorage.getItem("arxiv_agent_has_api_key") === "1";
+      const configured =
+        Boolean(key) ||
+        localStorage.getItem("arxiv_agent_has_api_key") === "1" ||
+        !getPreset(startupProvider).requiresApiKey;
       if (!configured) {
         setSetupOpen(true);
       }
@@ -304,9 +322,29 @@ function App() {
   const [progress, setProgress] = useState<SearchProgress | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const activeIdRef = useRef<string | null>(null);
+  const runSequenceRef = useRef(0);
+  const activeRunRef = useRef<{
+    runId: number;
+    threadId: string;
+    controller: AbortController;
+  } | null>(null);
 
   const notify = (message: string, severity: "success" | "info" | "warning" | "error") =>
     setToast({ message, severity });
+
+  // 线程切换/新建时先失效旧 run。旧 run 的 finally 可能晚于新 run，
+  // 因此不能再用全局 isSearching/abortRef 判断它是否拥有当前 UI 状态。
+  const invalidateActiveRun = useCallback(() => {
+    const run = activeRunRef.current;
+    if (!run) return;
+    activeRunRef.current = null;
+    runSequenceRef.current += 1;
+    run.controller.abort();
+    abortRef.current = null;
+    setIsSearching(false);
+    setProgress(null);
+    cancelThread(run.threadId).catch(() => {});
+  }, []);
 
   // ---------- 加载线程详情 ----------
   const selectThread = useCallback(
@@ -371,10 +409,7 @@ function App() {
 
   // ---------- 新建线程 ----------
   const handleNewThread = useCallback(async () => {
-    if (isSearching) {
-      abortRef.current?.abort();
-      if (activeThreadId) cancelThread(activeThreadId).catch(() => {});
-    }
+    invalidateActiveRun();
     try {
       const t = await createThread();
       setThreads((prev) => [t, ...prev]);
@@ -386,19 +421,16 @@ function App() {
       console.warn(err);
       notify("新建线程失败", "error");
     }
-  }, [isSearching, activeThreadId, selectThread, notify]);
+  }, [invalidateActiveRun, selectThread, notify]);
 
   // ---------- 切换线程 ----------
   const handleSelectThread = useCallback(
     async (id: string) => {
       if (id === activeThreadId) return;
-      if (isSearching) {
-        abortRef.current?.abort();
-        if (activeThreadId) cancelThread(activeThreadId).catch(() => {});
-      }
+      invalidateActiveRun();
       await selectThread(id);
     },
-    [activeThreadId, isSearching, selectThread],
+    [activeThreadId, invalidateActiveRun, selectThread],
   );
 
   // ---------- 重命名 ----------
@@ -412,15 +444,19 @@ function App() {
         }
       } catch (err) {
         console.warn(err);
+        notify((err as Error)?.message || "重命名失败，请稍后重试", "warning");
       }
     },
-    [activeThreadId],
+    [activeThreadId, notify],
   );
 
   // ---------- 删除线程 ----------
   const handleDeleteThread = useCallback(
     async (id: string) => {
       if (!confirm("确定删除该线程？此操作不可撤销。")) return;
+      if (id === activeThreadId && activeRunRef.current?.threadId === id) {
+        invalidateActiveRun();
+      }
       try {
         await deleteThread(id);
         const remaining = threads.filter((t) => t.id !== id);
@@ -439,13 +475,13 @@ function App() {
         notify("删除线程失败", "error");
       }
     },
-    [threads, activeThreadId, selectThread, notify],
+    [threads, activeThreadId, invalidateActiveRun, selectThread, notify],
   );
 
   // ---------- 发送消息 ----------
   const handleSendQuery = useCallback(
     async (queryText: string) => {
-      if (isSearching || !queryText.trim() || !activeThread) return;
+      if (isSearching || activeRunRef.current || !queryText.trim() || !activeThread) return;
       const threadId = activeThread.id;
 
       // 乐观：先追加用户消息
@@ -454,7 +490,14 @@ function App() {
       setStatusText("正在初始化 Agent...");
 
       const controller = new AbortController();
+      const runId = ++runSequenceRef.current;
+      activeRunRef.current = { runId, threadId, controller };
       abortRef.current = controller;
+      const providerOverrides = getProviderRequestOverrides(
+        config.provider,
+        config.endpoint,
+        config.modelName,
+      );
 
       try {
         await streamThreadMessage(
@@ -462,8 +505,8 @@ function App() {
           {
             query: queryText,
             api_key: config.apiKey,
-            base_url: config.endpoint,
-            model: config.modelName,
+            base_url: providerOverrides.base_url,
+            model: providerOverrides.model,
             provider: config.provider,
             max_search_rounds: config.maxSearchRounds,
             max_results_per_round: config.maxResultsPerRound,
@@ -474,7 +517,7 @@ function App() {
           },
           (env) => {
             // 切换了线程就不再更新
-            if (activeIdRef.current !== threadId) return;
+            if (activeRunRef.current?.runId !== runId || activeIdRef.current !== threadId) return;
             setActiveThread((prev) => (prev ? applyEvent(prev, env) : prev));
             setProgress((p) => deriveProgress(p, env));
             setStatusText(env.message || STATUS_LABEL.running);
@@ -490,6 +533,7 @@ function App() {
           controller.signal,
         );
       } catch (err: unknown) {
+        if (activeRunRef.current?.runId !== runId) return;
         const e = err as Error & { code?: string };
         if (e?.name === "AbortError") {
           setActiveThread((prev) =>
@@ -532,14 +576,20 @@ function App() {
           setStatusText(e?.message || "出错");
         }
       } finally {
-        abortRef.current = null;
+        if (activeRunRef.current?.runId !== runId) {
+          // 旧 run 只负责刷新列表，绝不能清掉当前线程/当前 run 的状态。
+          await refreshThreads();
+          return;
+        }
+        activeRunRef.current = null;
+        if (abortRef.current === controller) abortRef.current = null;
         setIsSearching(false);
         setProgress(null);
         if (activeIdRef.current === threadId) {
           try {
             const detail = await getThread(threadId);
             setActiveThread(detail);
-            setStatusText(STATUS_LABEL[detail.status]);
+            setStatusText(detail.status === "cancelled" ? "已停止当前检索" : STATUS_LABEL[detail.status]);
           } catch (err) {
             console.warn("刷新线程详情失败", err);
           }
@@ -552,11 +602,14 @@ function App() {
 
   // ---------- 停止检索（真正取消后端） ----------
   const handleStopSearch = useCallback(() => {
-    abortRef.current?.abort();
-    if (activeThreadId) {
-      cancelThread(activeThreadId).catch(() => {});
+    const run = activeRunRef.current;
+    if (run) {
+      run.controller.abort();
+      cancelThread(run.threadId).catch(() => {});
+      return;
     }
-  }, [activeThreadId]);
+    abortRef.current?.abort();
+  }, []);
 
   // ---------- 导出 ----------
   const handleExport = useCallback(
@@ -743,7 +796,7 @@ function App() {
       localStorage.setItem("arxiv_agent_crossref_mailto", next.crossrefMailto);
       localStorage.setItem("arxiv_agent_has_api_key", next.apiKey ? "1" : "0");
       try {
-        await saveApiKey(next.apiKey);
+        await saveProviderApiKey(next.provider, next.apiKey);
       } catch (err) {
         console.warn("保存 API Key 到安全存储失败，回退内存", err);
         notify("API Key 未能写入系统安全存储，本次仅保存在内存", "warning");
@@ -871,6 +924,7 @@ function App() {
                   papersList={papersList}
                   reportMd={reportMd}
                   evidence={activeThread?.evidence ?? []}
+                  citationCheck={activeThread?.citation_check}
                   activeTab={activeTab}
                   setActiveTab={setActiveTab}
                   hasChat={chatHistory.length > 0}
@@ -894,7 +948,7 @@ function App() {
         onSave={handleConfigSave}
         onClearKey={async () => {
           try {
-            await clearApiKey();
+            await clearProviderApiKey(config.provider);
           } catch {
             /* ignore */
           }
@@ -1042,6 +1096,7 @@ const AppSidebar = ({
               return (
                 <ListItemButton
                   key={t.id}
+                  aria-label={`线程 ${t.title || "新对话"}`}
                   selected={isActive}
                   onClick={() => !isEditing && onSelect(t.id)}
                   onDoubleClick={() => {
@@ -1118,6 +1173,7 @@ const AppSidebar = ({
                     <Tooltip title="重命名">
                       <IconButton
                         size="small"
+                        aria-label={`重命名 ${t.title || "新对话"}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           setEditingId(t.id);
@@ -1131,6 +1187,7 @@ const AppSidebar = ({
                     <Tooltip title="删除">
                       <IconButton
                         size="small"
+                        aria-label={`删除 ${t.title || "新对话"}`}
                         onClick={(e) => {
                           e.stopPropagation();
                           onDelete(t.id);
@@ -1307,6 +1364,7 @@ const ChatHeader = ({
       <Tooltip title="导出报告">
         <span>
           <IconButton
+            aria-label="导出报告"
             onClick={onExport}
             disabled={!canExportReport}
             sx={{
@@ -1334,6 +1392,7 @@ const STATUS_CHIP_COLOR: Record<ThreadStatus, string> = {
   done: "#4ade80",
   error: "#f87171",
   cancelled: "rgba(255,255,255,0.62)",
+  interrupted: "#fb923c",
 };
 
 const WindowControls = () => {
@@ -1976,6 +2035,22 @@ const EvidenceDialog = ({
             label={`分块 ${ref.chunkIndex}`}
             sx={{ bgcolor: "rgba(99,179,237,0.16)", color: "#9cc8f5" }}
           />
+          {chunk?.page_number != null && (
+            <Chip
+              size="small"
+              label={chunk.page_end && chunk.page_end !== chunk.page_number
+                ? `页码 ${chunk.page_number}-${chunk.page_end}`
+                : `页码 ${chunk.page_number}`}
+              sx={{ bgcolor: "rgba(251,191,36,0.14)", color: "#fcd34d" }}
+            />
+          )}
+          {chunk?.section_title && (
+            <Chip
+              size="small"
+              label={`章节 ${chunk.section_title}`}
+              sx={{ bgcolor: "rgba(167,139,250,0.14)", color: "#c4b5fd" }}
+            />
+          )}
           {chunk?.retrieval_sources.map((s) => (
             <Chip
               key={s}
@@ -2007,6 +2082,20 @@ const EvidenceDialog = ({
           <Typography sx={{ fontSize: 13, color: "rgba(255,255,255,0.6)", lineHeight: 1.7 }}>
             未找到匹配的证据切片：该引用未命中当前线程的证据库（可能基于摘要/元数据，或来自未持久化的历史轮次）。
           </Typography>
+        )}
+        {chunk && (chunk.source_url || chunk.pdf_url) && (
+          <Button
+            component="a"
+            size="small"
+            variant="text"
+            startIcon={<OpenInNewIcon sx={{ fontSize: 15 }} />}
+            href={(chunk.source_url || chunk.pdf_url)!}
+            target="_blank"
+            rel="noreferrer"
+            sx={{ mt: 1, px: 0.5, fontSize: 12 }}
+          >
+            打开原文
+          </Button>
         )}
       </DialogContent>
       <DialogActions>
@@ -2187,6 +2276,7 @@ const ResearchPanel = ({
   papersList,
   reportMd,
   evidence,
+  citationCheck,
   activeTab,
   setActiveTab,
   hasChat,
@@ -2198,6 +2288,7 @@ const ResearchPanel = ({
   papersList: Paper[];
   reportMd: string;
   evidence: EvidenceChunk[];
+  citationCheck?: ThreadDetail["citation_check"];
   activeTab: number;
   setActiveTab: (tab: number) => void;
   hasChat: boolean;
@@ -2319,6 +2410,11 @@ const ResearchPanel = ({
             </Box>
           ) : (
             <Box>
+              {citationCheck && citationCheck.total && !citationCheck.all_matched && (
+                <Alert severity="warning" sx={{ mb: 1.5, fontSize: 12 }}>
+                  报告中有 {citationCheck.unmatched?.length ?? 0} 条正文引用未命中已保存证据，请核对原文后再引用。
+                </Alert>
+              )}
               <Box sx={{ display: "flex", justifyContent: "flex-end", mb: 1 }}>
                 <Button size="small" startIcon={<ContentCopyIcon />} onClick={onCopyReport}>
                   复制报告
@@ -2532,10 +2628,40 @@ const EvidenceList = ({
               {chunk!.retrieval_sources.map((s) => (
                 <Chip key={s} label={s} size="small" sx={evidenceChipSx} />
               ))}
+              {chunk!.page_number != null && (
+                <Chip
+                  label={chunk!.page_end && chunk!.page_end !== chunk!.page_number
+                    ? `页码 ${chunk!.page_number}-${chunk!.page_end}`
+                    : `页码 ${chunk!.page_number}`}
+                  size="small"
+                  sx={{ ...evidenceChipSx, color: "#fcd34d" }}
+                />
+              )}
+              {chunk!.section_title && (
+                <Chip
+                  label={`章节 ${chunk!.section_title}`}
+                  size="small"
+                  sx={{ ...evidenceChipSx, color: "#c4b5fd" }}
+                />
+              )}
             </Box>
             <Typography sx={{ fontSize: 12, lineHeight: 1.55, color: "rgba(255,255,255,0.7)" }}>
               {chunk!.text}
             </Typography>
+            {(chunk!.source_url || chunk!.pdf_url) && (
+              <Button
+                component="a"
+                size="small"
+                variant="text"
+                startIcon={<OpenInNewIcon sx={{ fontSize: 14 }} />}
+                href={(chunk!.source_url || chunk!.pdf_url)!}
+                target="_blank"
+                rel="noreferrer"
+                sx={{ mt: 0.5, px: 0, fontSize: 11 }}
+              >
+                打开原文
+              </Button>
+            )}
           </Box>
         ))}
       </Box>
@@ -2576,10 +2702,15 @@ const SettingsDialog = ({
     setTesting(true);
     setHealth(null);
     try {
+      const providerOverrides = getProviderRequestOverrides(
+        config.provider,
+        config.endpoint,
+        config.modelName,
+      );
       const result = await getConfigHealth({
         api_key: config.apiKey,
-        base_url: config.endpoint,
-        model: config.modelName,
+        base_url: providerOverrides.base_url,
+        model: providerOverrides.model,
         provider: config.provider,
         providers: config.providers,
         openalex_mailto: config.openalexMailto,
@@ -2635,21 +2766,26 @@ const SettingsDialog = ({
             <Select
               value={config.provider}
               label="LLM 供应商"
-              onChange={(e) => {
+              onChange={async (e) => {
                 const prov = String(e.target.value);
                 const preset = getPreset(prov);
-                // 选预设：自动带出端点 + 默认模型，但保留用户已填的 API Key
+                // 选预设：自动带出端点 + 默认模型，并加载该 provider 自己的 Key
                 setConfig((prev) => ({
                   ...prev,
                   provider: prov,
                   endpoint: preset.endpoint,
                   modelName: preset.defaultModel,
+                  apiKey: "",
                 }));
+                const providerKey = await loadProviderApiKey(prov).catch(() => "");
+                setConfig((prev) =>
+                  prev.provider === prov ? { ...prev, apiKey: providerKey } : prev,
+                );
               }}
             >
               {PROVIDER_PRESETS.map((p) => (
-                <MenuItem key={p.id} value={p.id}>
-                  {p.label}
+                <MenuItem key={p.id} value={p.id} disabled={!p.supported}>
+                  {p.supported ? p.label : `${p.label}（暂未支持）`}
                 </MenuItem>
               ))}
             </Select>

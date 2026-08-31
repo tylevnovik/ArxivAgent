@@ -13,7 +13,7 @@
 		"test": "bun run test:unit",
 		"start": "electron .",
 		"smoke": "electron . --smoke-test",
-		"smoke:packaged": "./build/electron/win-unpacked/ArxivAgent.exe --smoke-test",
+		"smoke:packaged": "node scripts/smoke-packaged.cjs",
 		"dev": "concurrently \"bun run hmr\" \"electron .\"",
 		"dev:hmr": "bun run dev",
 		"hmr": "vite --port 5173",

@@ -74,6 +74,22 @@ export function CitationChip({
             </Typography>
             <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap", mb: 1 }}>
               <Chip label={`分块 ${evidence.chunk_index}`} size="small" sx={metaChip} />
+              {evidence.page_number != null && (
+                <Chip
+                  label={evidence.page_end && evidence.page_end !== evidence.page_number
+                    ? `页码 ${evidence.page_number}-${evidence.page_end}`
+                    : `页码 ${evidence.page_number}`}
+                  size="small"
+                  sx={{ ...metaChip, color: "#fcd34d" }}
+                />
+              )}
+              {evidence.section_title && (
+                <Chip
+                  label={`章节 ${evidence.section_title}`}
+                  size="small"
+                  sx={{ ...metaChip, color: "#c4b5fd" }}
+                />
+              )}
               {evidence.retrieval_sources.map((s) => (
                 <Chip key={s} label={s} size="small" sx={metaChip} />
               ))}
@@ -95,9 +111,9 @@ export function CitationChip({
             >
               {evidence.text}
             </Typography>
-            {evidence.arxiv_id && (
+            {(evidence.source_url || evidence.pdf_url || evidence.arxiv_id) && (
               <Link
-                href={`https://arxiv.org/abs/${evidence.arxiv_id}`}
+                href={evidence.source_url || evidence.pdf_url || `https://arxiv.org/abs/${evidence.arxiv_id}`}
                 target="_blank"
                 rel="noreferrer"
                 sx={{ fontSize: 12, mt: 1, display: "inline-block" }}

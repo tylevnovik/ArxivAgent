@@ -7,7 +7,7 @@
 import type { EvidenceChunk } from "./api";
 
 /** 【正文: 标题 | 分块 N】 标记的正则。标题和分块号都容错。 */
-const CITATION_RE = /【正文:\s*([^|】]+?)\s*\|\s*分块\s*([0-9]+)\s*】/g;
+const CITATION_RE = /【正文:\s*([^|】]+?)\s*\|\s*分块\s*([0-9]+)(?:\s*\|[^】]*)?\s*】/g;
 
 export type CitationRef = {
   paperTitle: string;

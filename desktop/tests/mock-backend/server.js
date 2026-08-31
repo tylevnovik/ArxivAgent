@@ -44,6 +44,8 @@ function newThread(title) {
 		messages: [],
 		papers: [],
 		report: "",
+		evidence: [],
+		citation_check: { total: 0, matched: 0, unmatched: [], all_matched: true },
 		last_error: null,
 	};
 	threads.set(id, t);
@@ -105,14 +107,39 @@ const MOCK_EVIDENCE = {
 	hybrid_score: 0.0001,
 	rerank_score: 0.0,
 	score: 0.0001,
+	page_number: 2,
+	page_end: 2,
+	section_title: "1. Introduction",
+	source_url: "https://arxiv.org/abs/1706.03762",
+	pdf_url: "https://arxiv.org/pdf/1706.03762",
 };
 
-function ndjson(res, events) {
+function ndjson(res, events, { delayMs = 0, onComplete, onClose } = {}) {
 	res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-	for (const e of events) {
-		res.write(JSON.stringify(e) + "\n");
-	}
-	res.end();
+	let index = 0;
+	let timer = null;
+	let closed = false;
+	const finish = (callback) => {
+		if (closed) return;
+		closed = true;
+		if (timer) clearTimeout(timer);
+		callback?.();
+	};
+	const sendNext = () => {
+		if (closed || res.writableEnded) return;
+		if (index >= events.length) {
+			res.end();
+			finish(onComplete);
+			return;
+		}
+		res.write(JSON.stringify(events[index++]) + "\n");
+		if (delayMs > 0) timer = setTimeout(sendNext, delayMs);
+		else sendNext();
+	};
+	res.on("close", () => {
+		if (!closed) finish(onClose);
+	});
+	sendNext();
 }
 
 const server = http.createServer((req, res) => {
@@ -128,16 +155,17 @@ const server = http.createServer((req, res) => {
 			return json_(res, 200, { ok: true, version: "0.2.0-mock" });
 		}
 		if (path === "/api/config/health" && (req.method === "GET" || req.method === "POST")) {
+			const invalidEndpoint = String(json.base_url || "").startsWith("javascript:");
 			return json_(res, 200, {
-				ok: true,
+				ok: !invalidEndpoint,
 				api_key_configured: true,
 				api_key_source: "env",
 				provider: "deepseek",
 				endpoint: "https://api.deepseek.com",
 				model: "deepseek-v4-flash",
 				data_dir: "/tmp/mock",
-				llm_reachable: true,
-				llm_detail: "ok",
+				llm_reachable: invalidEndpoint ? false : true,
+				llm_detail: invalidEndpoint ? "API endpoint 无效" : "ok",
 				providers: [{ name: "arxiv", ok: true, detail: "ok" }],
 			});
 		}
@@ -181,13 +209,19 @@ const server = http.createServer((req, res) => {
 				if (!json.query || !json.query.trim()) {
 					return json_(res, 400, errBody("validation", "query 不能为空", true));
 				}
-				if (!json.api_key) {
+				const keylessProvider = ["ollama", "vllm", "custom"].includes(String(json.provider || "").toLowerCase());
+				if (!json.api_key && !keylessProvider) {
 					return json_(res, 400, errBody("no_api_key", "未提供 API Key", true));
 				}
 				// 脚本化事件序列
 				t.status = "running";
 				t.messages.push({ role: "user", content: json.query, timestamp: now(), kind: "text" });
-				return ndjson(res, scriptedEvents(t));
+				const slow = String(json.query).includes("[slow]");
+				return ndjson(res, scriptedEvents(t), {
+					delayMs: slow ? 120 : 0,
+					onComplete: () => finishScriptedThread(t),
+					onClose: () => { t.status = "cancelled"; },
+				});
 			}
 			const msgMatch = sub && sub.match(/^messages\/(\d+)$/);
 			if (msgMatch && req.method === "PATCH") {
@@ -263,9 +297,8 @@ function scriptedEvents(t) {
 	// 模拟一次完整检索流：intent → thinking → searching → searching_done → report → done
 	t.papers = MOCK_PAPERS;
 	t.report = "# 检索报告\n\nTransformer 是基础架构【正文: Attention Is All You Need | 分块 0】。";
-	t.status = "done";
 	t.evidence = [MOCK_EVIDENCE];
-	t.messages.push({ role: "assistant", content: t.report, timestamp: now(), kind: "report" });
+	t.citation_check = { total: 1, matched: 1, unmatched: [], all_matched: true };
 	return [
 		{ type: "intent", message: "Agent 已启动…", timestamp: now() },
 		{ type: "thinking", message: "分析检索需求…", timestamp: now() },
@@ -276,9 +309,22 @@ function scriptedEvents(t) {
 			type: "done",
 			message: "✅ 检索完成！",
 			timestamp: now(),
-			payload: { kind: "search", papers: MOCK_PAPERS, report: t.report, evidence: [MOCK_EVIDENCE] },
+			payload: {
+				kind: "search",
+				papers: MOCK_PAPERS,
+				report: t.report,
+				evidence: [MOCK_EVIDENCE],
+				citation_check: t.citation_check,
+			},
 		},
 	];
+}
+
+function finishScriptedThread(t) {
+	t.status = "done";
+	if (!t.messages.some((message) => message.kind === "report" && message.content === t.report)) {
+		t.messages.push({ role: "assistant", content: t.report, timestamp: now(), kind: "report" });
+	}
 }
 
 function json_(res, status, obj) {

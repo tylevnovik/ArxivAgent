@@ -10,7 +10,7 @@ import { marked } from "marked";
 import DOMPurify from "dompurify";
 
 // 把 【正文: 标题 | 分块 N】 转成可点击的 data-cite span（视觉徽标）
-const CITATION_RE = /【正文:\s*([^|】]+?)\s*\|\s*分块\s*([0-9]+)\s*】/g;
+const CITATION_RE = /【正文:\s*([^|】]+?)\s*\|\s*分块\s*([0-9]+)(?:\s*\|[^】]*)?\s*】/g;
 
 function transformCitations(markdown: string): string {
   return markdown.replace(

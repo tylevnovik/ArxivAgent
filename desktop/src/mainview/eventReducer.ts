@@ -134,6 +134,7 @@ export function applyEvent(state: ThreadDetail, env: AgentEventEnvelope): Thread
         papers?: Paper[];
         report?: string;
         evidence?: import("./api").EvidenceChunk[];
+        citation_check?: ThreadDetail["citation_check"];
       };
       // 检索类完成：用最终 papers/report/evidence 覆盖
       let papers = state.papers;
@@ -151,6 +152,7 @@ export function applyEvent(state: ThreadDetail, env: AgentEventEnvelope): Thread
         papers,
         report,
         evidence,
+        citation_check: payload.citation_check ?? state.citation_check,
         last_error: null,
       };
     }

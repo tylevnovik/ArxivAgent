@@ -77,5 +77,70 @@ test("app boots, renders composer, and completes a search", async () => {
 	await expect(window.getByLabel("编辑消息").first()).toBeVisible();
 	await expect(window.getByLabel("删除消息").first()).toBeVisible();
 
+	// 证据元数据应进入真实研究资料面板，而不只存在于 API payload。
+	await window.getByRole("tab", { name: "报告" }).click();
+	await expect(window.getByText("页码 2")).toBeVisible();
+	await expect(window.getByText("章节 1. Introduction")).toBeVisible();
+	await expect(window.getByText("打开原文")).toBeVisible();
+
+	await electronApp.close();
+});
+
+test("can cancel a slow search without leaving the composer stuck", async () => {
+	const electronApp = await electron.launch({
+		args: [path.resolve(__dirname, "..", "..", "src", "electron", "main.cjs")],
+		env: { ...process.env, ARXIV_AGENT_E2E: "1" },
+	});
+	const window = await electronApp.firstWindow();
+	await window.waitForLoadState("domcontentloaded");
+	await expect(window.locator("textarea").first()).toBeVisible({ timeout: 15000 });
+
+	await window.locator("textarea").first().fill("[slow] cancel this search");
+	await window.getByRole("button", { name: "Send message" }).click();
+	await expect(window.getByRole("button", { name: "Stop search" })).toBeVisible();
+	await window.getByRole("button", { name: "Stop search" }).click();
+	await expect(window.getByRole("button", { name: "Send message" })).toBeVisible({ timeout: 10000 });
+	await expect(window.getByText("已停止当前检索", { exact: true }).first()).toBeVisible();
+
+	await electronApp.close();
+});
+
+test("can rename, switch away from, and delete a thread", async () => {
+	const electronApp = await electron.launch({
+		args: [path.resolve(__dirname, "..", "..", "src", "electron", "main.cjs")],
+		env: { ...process.env, ARXIV_AGENT_E2E: "1" },
+	});
+	const window = await electronApp.firstWindow();
+	await window.waitForLoadState("domcontentloaded");
+	await expect(window.locator("textarea").first()).toBeVisible({ timeout: 15000 });
+
+	await window.getByRole("button", { name: "新建检索" }).click();
+	await expect(window.getByRole("button", { name: "线程 新对话" }).last()).toBeVisible();
+	await window.getByRole("button", { name: /重命名 新对话/ }).last().click();
+	const titleInput = window.locator('input[type="text"]').last();
+	await titleInput.fill("First thread");
+	await titleInput.press("Enter");
+	await expect(window.getByText("First thread", { exact: true }).first()).toBeVisible();
+
+	await window.getByRole("button", { name: "新建检索" }).click();
+	await window.getByRole("button", { name: /重命名 新对话/ }).last().click();
+	await window.locator('input[type="text"]').last().fill("Second thread");
+	await window.locator('input[type="text"]').last().press("Enter");
+	await expect(window.getByText("Second thread", { exact: true }).first()).toBeVisible();
+
+	// 第一线程在运行中时切到第二线程；旧流不得把新线程 UI 重置。
+	await window.getByRole("button", { name: "线程 First thread" }).click();
+	await window.locator("textarea").first().fill("[slow] switch away");
+	await window.getByRole("button", { name: "Send message" }).click();
+	await expect(window.getByRole("button", { name: "Stop search" })).toBeVisible();
+	await window.getByRole("button", { name: "线程 Second thread" }).click();
+	await expect(window.getByText("Second thread", { exact: true }).first()).toBeVisible();
+	await expect(window.getByRole("button", { name: "Stop search" })).toHaveCount(0);
+
+	// 删除当前线程，确认应用回到一个可用线程，而不是卡在已删除对象。
+	window.once("dialog", (dialog) => dialog.accept());
+	await window.getByRole("button", { name: "删除 Second thread" }).click();
+	await expect(window.getByText("First thread", { exact: true }).first()).toBeVisible({ timeout: 10000 });
+
 	await electronApp.close();
 });

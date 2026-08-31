@@ -6,3 +6,4 @@ artifacts/
 test-results/
 llms.txt
 *.tsbuildinfo
+mock_report_*.md

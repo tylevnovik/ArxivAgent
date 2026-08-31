@@ -2,7 +2,8 @@
  * 内置 LLM 供应商预设。
  *
  * 设计目标：用户在配置中心选一个供应商，端点 + 默认模型 + 文档链接自动带出，
- * 只需填 API Key。供应商都走 OpenAI 兼容协议（后端 core/llm.py 用 openai SDK）。
+ * 只需填 API Key。当前后端真正接通的是 OpenAI-compatible transport；原生协议
+ * provider 会明确标记为暂未支持，避免出现“下拉可选但请求必失败”。
  *
  * 模型清单已逐家核对官方文档（2026-06）：
  * - DeepSeek（api-docs.deepseek.com/quick_start/pricing）：
@@ -40,6 +41,9 @@
  * - defaultModel：该供应商常用的默认模型（用户可改）
  * - models：可选的常用模型候选，供下拉快速选
  * - keyHint：API Key 输入框的占位提示（环境变量名）
+ * - apiKeyEnv：后端读取的环境变量名（可选）
+ * - endpointEnv：后端读取的 endpoint 环境变量名（可选）
+ * - requiresApiKey：该端点是否必须有 API Key；本地端点可为 false
  * - docsUrl：获取 API Key 的官方文档链接
  * - note：该供应商的小提示（可选）
  */
@@ -50,6 +54,10 @@ export type ProviderPreset = {
 	defaultModel: string;
 	models: string[];
 	keyHint: string;
+	apiKeyEnv?: string;
+	endpointEnv?: string;
+	requiresApiKey: boolean;
+	supported: boolean;
 	docsUrl: string;
 	note?: string;
 };
@@ -62,6 +70,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		defaultModel: "deepseek-v4-flash",
 		models: ["deepseek-v4-flash", "deepseek-v4-pro"],
 		keyHint: "留空则用环境变量 DEEPSEEK_API_KEY",
+		apiKeyEnv: "DEEPSEEK_API_KEY",
+		endpointEnv: "DEEPSEEK_BASE_URL",
+		requiresApiKey: true,
+		supported: true,
 		docsUrl: "https://platform.deepseek.com/api_keys",
 		note: "推荐。国内可直连，性价比高。V4 系列上下文 1M，支持思考/非思考模式（默认思考）。",
 	},
@@ -72,6 +84,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		defaultModel: "glm-4.6",
 		models: ["glm-5.1", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5-air", "glm-4.7-flash", "glm-4-long"],
 		keyHint: "留空则用环境变量 ZHIPU_API_KEY",
+		apiKeyEnv: "ZHIPU_API_KEY",
+		endpointEnv: "ZHIPU_API_BASE",
+		requiresApiKey: true,
+		supported: true,
 		docsUrl: "https://open.bigmodel.cn/usercenter/apikeys",
 		note: "国内直连。旗舰 GLM-5.1（200K）；GLM-4.6 通用高性价比；glm-4.7-flash 免费可用。",
 	},
@@ -82,6 +98,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		defaultModel: "kimi-k2.7-code",
 		models: ["kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "moonshot-v1-128k", "moonshot-v1-32k"],
 		keyHint: "留空则用环境变量 MOONSHOT_API_KEY",
+		apiKeyEnv: "MOONSHOT_API_KEY",
+		endpointEnv: "MOONSHOT_API_BASE",
+		requiresApiKey: true,
+		supported: true,
 		docsUrl: "https://platform.moonshot.cn/console/api-keys",
 		note: "国内直连。旗舰 kimi-k2.7-code（代码/Agent 最强，默认思考）；kimi-k2.6 多模态（256K）。",
 	},
@@ -92,6 +112,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		defaultModel: "qwen-plus",
 		models: ["qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash", "qwen-long", "qwen3-coder-plus"],
 		keyHint: "留空则用环境变量 DASHSCOPE_API_KEY",
+		apiKeyEnv: "DASHSCOPE_API_KEY",
+		endpointEnv: "DASHSCOPE_API_BASE",
+		requiresApiKey: true,
+		supported: true,
 		docsUrl: "https://bailian.console.aliyun.com/?apiKey=1#/api-key",
 		note: "国内直连，走 DashScope OpenAI 兼容模式。旗舰 qwen3.7-max；qwen3.7-plus 均衡。",
 	},
@@ -102,6 +126,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		defaultModel: "gpt-5.5",
 		models: ["gpt-5.5", "gpt-5.4-mini", "gpt-5.4-nano"],
 		keyHint: "留空则用环境变量 OPENAI_API_KEY",
+		apiKeyEnv: "OPENAI_API_KEY",
+		endpointEnv: "OPENAI_API_BASE",
+		requiresApiKey: true,
+		supported: true,
 		docsUrl: "https://platform.openai.com/api-keys",
 		note: "国内通常需要代理。旗舰 gpt-5.5，最适合编程与 Agent 任务。",
 	},
@@ -112,8 +140,26 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		defaultModel: "claude-sonnet-4-6",
 		models: ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"],
 		keyHint: "留空则用环境变量 ANTHROPIC_API_KEY",
+		apiKeyEnv: "ANTHROPIC_API_KEY",
+		endpointEnv: "ANTHROPIC_BASE_URL",
+		requiresApiKey: true,
+		supported: false,
 		docsUrl: "https://console.anthropic.com/settings/keys",
 		note: "后端默认走 OpenAI 兼容协议；部分场景可能需额外适配。旗舰 claude-opus-4-8。",
+	},
+	{
+		id: "gemini",
+		label: "Google Gemini",
+		endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
+		defaultModel: "gemini-2.5-flash",
+		models: ["gemini-2.5-flash", "gemini-2.5-pro"],
+		keyHint: "留空则用环境变量 GEMINI_API_KEY",
+		apiKeyEnv: "GEMINI_API_KEY",
+		endpointEnv: "GEMINI_API_BASE",
+		requiresApiKey: true,
+		supported: false,
+		docsUrl: "https://aistudio.google.com/app/apikey",
+		note: "已纳入 provider 目录；当前版本仍需 LiteLLM/native transport，暂不可直接调用。",
 	},
 	{
 		id: "mimo",
@@ -122,6 +168,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		defaultModel: "mimo-v2.5-pro",
 		models: ["mimo-v2.5-pro", "mimo-v2.5"],
 		keyHint: "留空则用环境变量 MIMO_API_KEY",
+		apiKeyEnv: "MIMO_API_KEY",
+		endpointEnv: "MIMO_API_BASE",
+		requiresApiKey: true,
+		supported: true,
 		docsUrl: "https://platform.xiaomimimo.com/token-plan",
 		note: "国内直连。Token Plan 订阅包（¥39/月起），Key 与按量付费不互通。旗舰 mimo-v2.5-pro（1M 上下文）。",
 	},
@@ -139,8 +189,40 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 			"mimo-v2.5-pro",
 		],
 		keyHint: "填入 OpenCode Go 订阅的 API Key",
+		apiKeyEnv: "OPENCODE_GO_API_KEY",
+		endpointEnv: "OPENCODE_GO_API_BASE",
+		requiresApiKey: true,
+		supported: true,
 		docsUrl: "https://opencode.ai/docs/go/",
 		note: "订阅制聚合网关（一个 Key 用多家模型）。推荐 deepseek-v4-flash（快且 JSON 稳）；kimi-k3 不兼容（强制 temperature=1），minimax 系列思考内容会混入正文。",
+	},
+	{
+		id: "ollama",
+		label: "Ollama（本地）",
+		endpoint: "http://localhost:11434/v1",
+		defaultModel: "llama3.2",
+		models: [],
+		keyHint: "本地 Ollama 不需要 API Key",
+		apiKeyEnv: "OLLAMA_API_KEY",
+		endpointEnv: "OLLAMA_API_BASE",
+		requiresApiKey: false,
+		supported: true,
+		docsUrl: "https://ollama.com/",
+		note: "默认连接 localhost:11434/v1；请先启动 Ollama 并下载模型。",
+	},
+	{
+		id: "vllm",
+		label: "vLLM（本地）",
+		endpoint: "http://localhost:8000/v1",
+		defaultModel: "",
+		models: [],
+		keyHint: "本地 vLLM 通常不需要 API Key",
+		apiKeyEnv: "VLLM_API_KEY",
+		endpointEnv: "VLLM_API_BASE",
+		requiresApiKey: false,
+		supported: true,
+		docsUrl: "https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html",
+		note: "默认连接 localhost:8000/v1；模型名称需与 vLLM 的 --served-model-name 一致。",
 	},
 	{
 		id: "custom",
@@ -148,7 +230,11 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
 		endpoint: "",
 		defaultModel: "",
 		models: [],
-		keyHint: "填入你的 API Key",
+		keyHint: "可选：按端点要求填写 API Key",
+		apiKeyEnv: "CUSTOM_API_KEY",
+		endpointEnv: "CUSTOM_API_BASE",
+		requiresApiKey: false,
+		supported: true,
 		docsUrl: "",
 		note: "任何兼容 OpenAI 协议的端点（本地 Ollama / vLLM / LM Studio 等）。",
 	},
@@ -160,4 +246,25 @@ export function getPreset(id: string): ProviderPreset {
 		PROVIDER_PRESETS.find((p) => p.id === id) ??
 		PROVIDER_PRESETS[PROVIDER_PRESETS.length - 1]
 	);
+}
+
+/**
+ * 只把用户真正改过的 endpoint/model 发给后端。
+ * 预设默认值留空后，provider 自己的环境变量才能按后端规则生效。
+ */
+export function getProviderRequestOverrides(
+	provider: string,
+	endpoint: string,
+	model: string,
+): { base_url?: string; model?: string } {
+	const preset = getPreset(provider);
+	const normalizedEndpoint = endpoint.trim().replace(/\/+$/, "");
+	const normalizedPresetEndpoint = preset.endpoint.trim().replace(/\/+$/, "");
+	return {
+		base_url:
+			normalizedEndpoint && normalizedEndpoint !== normalizedPresetEndpoint
+				? normalizedEndpoint
+				: undefined,
+		model: model.trim() && model.trim() !== preset.defaultModel ? model.trim() : undefined,
+	};
 }

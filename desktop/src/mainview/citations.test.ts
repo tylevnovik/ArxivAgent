@@ -41,6 +41,11 @@ describe("extractCitations", () => {
     ]);
   });
 
+  it("accepts a citation marker with legacy inline metadata", () => {
+    expect(extractCitations("见【正文: Paper | 分块 2 | 来源=dense】。"))
+      .toEqual([{ paperTitle: "Paper", chunkIndex: "2" }]);
+  });
+
   it("extracts multiple markers", () => {
     const text = "a【正文: BERT | 分块 3】b【正文: GPT | 分块 1】c";
     expect(extractCitations(text)).toHaveLength(2);

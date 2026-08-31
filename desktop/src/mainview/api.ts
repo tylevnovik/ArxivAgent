@@ -73,7 +73,7 @@ export type Paper = {
 
 // ===================== 线程 =====================
 
-export type ThreadStatus = "idle" | "running" | "done" | "error" | "cancelled";
+export type ThreadStatus = "idle" | "running" | "done" | "error" | "cancelled" | "interrupted";
 
 export type ThreadMeta = {
   id: string;
@@ -108,6 +108,11 @@ export type EvidenceChunk = {
   hybrid_score: number;
   rerank_score: number;
   score: number;
+  page_number?: number | null;
+  page_end?: number | null;
+  section_title?: string;
+  source_url?: string;
+  pdf_url?: string;
 };
 
 export type ThreadDetail = {
@@ -120,6 +125,12 @@ export type ThreadDetail = {
   papers: Paper[];
   report: string;
   evidence: EvidenceChunk[];
+  citation_check?: {
+    total?: number;
+    matched?: number;
+    unmatched?: Array<{ paper_title: string; chunk_index: string }>;
+    all_matched?: boolean;
+  };
   last_error: string | null;
 };
 

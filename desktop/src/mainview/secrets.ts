@@ -11,6 +11,11 @@
 
 const LOCAL_KEY = "arxiv_agent_api_key_dev";
 
+function providerSecretName(provider: string): string {
+  const safeProvider = provider.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+  return `api_key_provider_${safeProvider || "default"}`;
+}
+
 type SecretsBridge = {
   secrets?: {
     get: (key: string) => Promise<string | null>;
@@ -81,6 +86,30 @@ export async function clearApiKey(): Promise<void> {
     }
   }
   localStorage.removeItem(LOCAL_KEY);
+}
+
+/**
+ * Provider-scoped API Key storage.  Keeping one secret per provider prevents
+ * switching from OpenAI to MiMo (or a local endpoint) from reusing the old
+ * provider's credential.
+ */
+export async function loadProviderApiKey(provider: string): Promise<string> {
+  const value = await loadSecret(providerSecretName(provider));
+  if (value) return value;
+  // One-time compatibility fallback for the pre-provider-scoped DeepSeek key.
+  if (provider.trim().toLowerCase() === "deepseek") return loadApiKey();
+  return "";
+}
+
+export async function saveProviderApiKey(provider: string, value: string): Promise<void> {
+  await saveSecret(providerSecretName(provider), value);
+  // Keep old storage clean once DeepSeek has been saved in the new namespace.
+  if (provider.trim().toLowerCase() === "deepseek") await clearApiKey();
+}
+
+export async function clearProviderApiKey(provider: string): Promise<void> {
+  await saveSecret(providerSecretName(provider), "");
+  if (provider.trim().toLowerCase() === "deepseek") await clearApiKey();
 }
 
 /**

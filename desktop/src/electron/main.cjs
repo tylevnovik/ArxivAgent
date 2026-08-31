@@ -928,7 +928,7 @@ async function bootstrap() {
 			rendererUrl,
 			packaged: app.isPackaged,
 		}));
-		stopPythonBackend();
+		await stopPythonBackend();
 		app.exit(backendResult.ok && rendererReady && authOk ? 0 : 1);
 		return;
 	}
@@ -947,6 +947,13 @@ void app.whenReady().then(() => {
 	registerExportHandlers();
 	registerWindowHandlers();
 	return bootstrap();
+	}).catch(async (err) => {
+		console.error("[Electron Main] Bootstrap failed:", err);
+		try {
+			await stopPythonBackend();
+		} finally {
+			app.exit(1);
+		}
 });
 
 process.on("exit", () => {
@@ -959,7 +966,12 @@ process.on("exit", () => {
 process.on("uncaughtException", (err) => {
 	console.error("[Electron Main] Uncaught exception:", err);
 	stopPythonBackendSync();
+	if (isSmokeTest) app.exit(1);
 });
 process.on("unhandledRejection", (reason) => {
 	console.error("[Electron Main] Unhandled rejection:", reason);
+	if (isSmokeTest) {
+		stopPythonBackendSync();
+		app.exit(1);
+	}
 });

@@ -37,8 +37,8 @@ import {
 } from "@mui/icons-material";
 import type { AppConfig, ConfigHealth } from "./api";
 import { getConfigHealth } from "./api";
-import { PROVIDER_PRESETS, getPreset } from "./providers";
-import { hasSecretsBridge, saveApiKey } from "./secrets";
+import { PROVIDER_PRESETS, getPreset, getProviderRequestOverrides } from "./providers";
+import { hasSecretsBridge, loadProviderApiKey, saveProviderApiKey } from "./secrets";
 
 type Diagnosis = {
   ok: boolean;
@@ -109,10 +109,15 @@ export function SetupWizard({
     setTesting(true);
     setHealth(null);
     try {
+      const providerOverrides = getProviderRequestOverrides(
+        config.provider,
+        config.endpoint,
+        config.modelName,
+      );
       const result = await getConfigHealth({
         api_key: config.apiKey,
-        base_url: config.endpoint,
-        model: config.modelName,
+        base_url: providerOverrides.base_url,
+        model: providerOverrides.model,
         provider: config.provider,
         providers: config.providers,
         ping_llm: true,
@@ -148,7 +153,7 @@ export function SetupWizard({
       localStorage.setItem("arxiv_agent_has_api_key", config.apiKey ? "1" : "0");
       // API Key 走安全存储
       try {
-        await saveApiKey(config.apiKey);
+        await saveProviderApiKey(config.provider, config.apiKey);
       } catch (err) {
         console.warn("保存 API Key 失败", err);
       }
@@ -167,7 +172,10 @@ export function SetupWizard({
   // 判断当前主要问题，决定分区顺序与高亮
   const envBroken =
     diagnosis && !diagnosis.ok && !diagnosis.healthy;
-  const keyMissing = !config.apiKey;
+  const currentPreset = getPreset(config.provider);
+  const providerUnsupported = !currentPreset.supported;
+  const keyMissing = currentPreset.requiresApiKey && !config.apiKey;
+  const endpointMissing = !config.endpoint.trim();
 
   return (
     <Dialog
@@ -195,19 +203,35 @@ export function SetupWizard({
           </Typography>
 
           {/* ============ Step 1: LLM 供应商 + API Key ============ */}
-          <SectionHeader step={1} title="配置 LLM 供应商与 API Key" required={keyMissing} />
+          <SectionHeader
+            step={1}
+            title="配置 LLM 供应商与 API Key"
+            required={providerUnsupported || keyMissing || endpointMissing}
+          />
           <Box
             sx={{
               p: 2.5,
               mb: 3,
               borderRadius: 2,
-              bgcolor: keyMissing ? "rgba(248,113,113,0.05)" : "rgba(74,222,128,0.05)",
-              border: `1px solid ${keyMissing ? "rgba(248,113,113,0.3)" : "rgba(74,222,128,0.3)"}`,
+            bgcolor: providerUnsupported || keyMissing || endpointMissing ? "rgba(248,113,113,0.05)" : "rgba(74,222,128,0.05)",
+            border: `1px solid ${providerUnsupported || keyMissing || endpointMissing ? "rgba(248,113,113,0.3)" : "rgba(74,222,128,0.3)"}`,
             }}
           >
-            {keyMissing ? (
+            {providerUnsupported ? (
+              <Typography sx={{ mb: 2, fontSize: 13, color: "#fca5a5" }}>
+                当前 provider 的原生协议尚未接入，请选择一个标记为可用的供应商。
+              </Typography>
+            ) : keyMissing ? (
               <Typography sx={{ mb: 2, fontSize: 13, color: "#fca5a5" }}>
                 尚未配置 API Key，请先选一个供应商并填入 Key。
+              </Typography>
+            ) : endpointMissing ? (
+              <Typography sx={{ mb: 2, fontSize: 13, color: "#fca5a5" }}>
+                当前供应商需要 API endpoint，请填写 Base URL。
+              </Typography>
+            ) : !currentPreset.requiresApiKey ? (
+              <Typography sx={{ mb: 2, fontSize: 13, color: "#86efac" }}>
+                ✓ 当前端点不强制要求 API Key，可直接连接本地或匿名服务。
               </Typography>
             ) : (
               <Typography sx={{ mb: 2, fontSize: 13, color: "#86efac" }}>
@@ -221,19 +245,24 @@ export function SetupWizard({
               <Select
                 value={config.provider}
                 label="LLM 供应商"
-                onChange={(e) => {
+                onChange={async (e) => {
                   const preset = getPreset(String(e.target.value));
                   setConfig((prev) => ({
                     ...prev,
                     provider: preset.id,
                     endpoint: preset.endpoint,
                     modelName: preset.defaultModel,
+                    apiKey: "",
                   }));
+                  const providerKey = await loadProviderApiKey(preset.id).catch(() => "");
+                  setConfig((prev) =>
+                    prev.provider === preset.id ? { ...prev, apiKey: providerKey } : prev,
+                  );
                 }}
               >
                 {PROVIDER_PRESETS.map((p) => (
-                  <MenuItem key={p.id} value={p.id}>
-                    {p.label}
+                  <MenuItem key={p.id} value={p.id} disabled={!p.supported}>
+                    {p.supported ? p.label : `${p.label}（暂未支持）`}
                   </MenuItem>
                 ))}
               </Select>
@@ -276,7 +305,7 @@ export function SetupWizard({
 
             {/* API Key */}
             <TextField
-              label="API Key"
+              label={`API Key${currentPreset.requiresApiKey ? "" : "（可选）"}`}
               size="small"
               type="password"
               fullWidth
@@ -518,7 +547,7 @@ export function SetupWizard({
               variant="contained"
               startIcon={saving ? <CircularProgress size={16} /> : undefined}
               onClick={handleSave}
-              disabled={saving || keyMissing}
+              disabled={saving || providerUnsupported || keyMissing || endpointMissing}
             >
               保存并开始
             </Button>
