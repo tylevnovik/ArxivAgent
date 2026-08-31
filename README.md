@@ -78,13 +78,14 @@ ArxivAgent/
 │   ├── src/electron/         #   主进程（Python 后端启动 / 依赖诊断 / safeStorage）
 │   ├── src/mainview/         #   渲染进程（线程列表 / 聊天 / 研究面板 / 引用 / 设置）
 │   └── tests/                #   E2E + 集成 + mock 后端
-├── tests/backend/            # 后端 pytest（27 tests）
+├── tests/backend/            # 后端 pytest（200 tests）
 ├── app.py                    # FastAPI 后端入口
 ├── config.py                 # 配置管理
 ├── pyproject.toml            # Python 依赖 & uv 配置
 ├── .python-version           # 3.12
 ├── pytest.ini                # pytest 配置
-└── implementation_plan.md    # 版本设计与验证记录
+├── implementation_plan.md    # 版本设计与验证记录
+└── docs/plans/               # 本次稳定性与发布加固计划
 ```
 
 ## 架构
@@ -131,6 +132,10 @@ ArxivAgent/
 | POST | `/api/config/health` | 探测 LLM / 检索源连通性 |
 | GET | `/api/config/health` | 获取上次探测结果 |
 
+`/api/health`、`/api/system/deps`、`/api/auth/status` 仅用于启动诊断；配置健康探测
+需要桌面端 HMAC 签名。CORS 只允许本地 Vite 开发源和 Electron `file://` 页面，
+不会接受任意网站来源。
+
 ## 数据目录
 
 运行期数据（线程、PDF 缓存、检索缓存、导出文件、Qdrant 索引）默认放在用户数据目录：
@@ -154,8 +159,26 @@ ArxivAgent/
 | `DEEPSEEK_API_KEY` | （空） | API Key |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 端点（可改为任意 OpenAI 兼容服务） |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 模型名 |
+| `OPENCODE_GO_API_KEY` | （空） | OpenCode Go 订阅 Key |
+| `OPENCODE_GO_API_BASE` | `https://opencode.ai/zen/go/v1` | OpenCode Go 端点 |
+| `OPENAI_API_KEY` | （空） | OpenAI 或任意 OpenAI-compatible 端点的 Key |
+| `OPENAI_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible 端点 |
+| `MIMO_API_KEY` | （空） | MiMo Key |
+| `MIMO_API_BASE` | `https://token-plan-cn.xiaomimimo.com/v1` | MiMo 端点 |
+| `ZHIPU_API_KEY` | （空） | 智谱 GLM Key |
+| `ZHIPU_API_BASE` | `https://open.bigmodel.cn/api/paas/v4` | 智谱 OpenAI-compatible 端点 |
+| `MOONSHOT_API_KEY` | （空） | Moonshot Kimi Key |
+| `MOONSHOT_API_BASE` | `https://api.moonshot.cn/v1` | Moonshot 端点 |
+| `DASHSCOPE_API_KEY` | （空） | 阿里百炼 Key |
+| `DASHSCOPE_API_BASE` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | DashScope 兼容端点 |
+| `OLLAMA_API_BASE` | `http://localhost:11434/v1` | 本地 Ollama，无需 Key |
+| `VLLM_API_BASE` | `http://localhost:8000/v1` | 本地 vLLM，无需 Key（可选 `VLLM_API_KEY`） |
+| `CUSTOM_API_BASE` | （空） | 自定义 OpenAI-compatible 端点（需同时设置 `CUSTOM_MODEL`） |
+| `CUSTOM_API_KEY` | （空） | 自定义端点的可选 Key |
 
-桌面端支持通过设置面板配置，API Key 走 Electron safeStorage 加密存储。
+模型请求会按“请求输入 > 对应 provider 环境变量 > provider 默认值”解析；桌面端
+设置面板的 Key 按 provider 分开存储，并优先走 Electron safeStorage。Gemini 和
+Anthropic 的环境变量已纳入目录，但当前后端尚未接入其原生 transport，不会伪装成可用。
 
 ### 多源检索
 
@@ -164,6 +187,8 @@ ArxivAgent/
 | `SEARCH_PROVIDERS` | `arxiv,openalex,crossref` | 启用的检索源（逗号分隔） |
 | `SEARCH_PROVIDER_TIMEOUT_SECONDS` | `15` | 单源超时（秒） |
 | `SEARCH_CACHE_TTL_SECONDS` | `86400` | 缓存 TTL（秒） |
+| `SEARCH_CACHE_MAX_BYTES` | `268435456` | 搜索缓存总容量上限（字节） |
+| `SEARCH_CACHE_MAX_FILES` | `500` | 搜索缓存文件数上限，按最旧优先清理 |
 | `OPENALEX_MAILTO` | （空） | OpenAlex polite pool 邮箱 |
 | `CROSSREF_MAILTO` | （空） | Crossref polite pool 邮箱 |
 | `SEMANTIC_SCHOLAR_API_KEY` | （空） | Semantic Scholar API Key（可选） |
@@ -188,7 +213,7 @@ ArxivAgent/
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `ARXIV_AGENT_DATA_DIR` | 项目根目录 | 运行期数据根目录（桌面端设为 userData/backend-data） |
+| `ARXIV_AGENT_DATA_DIR` | 平台用户数据目录 | 运行期数据根目录（桌面端设为 userData/backend-data） |
 
 子目录：`threads/`（线程 JSON）、`exports/`（导出文件）、`.cache/search/`（检索缓存）、
 `pdf_cache/`（PDF 缓存）、`.cache/qdrant/`（向量库）。
@@ -221,8 +246,10 @@ bun run build:canary   # prepare:backend-runtime + build + electron-builder --wi
 pytest tests/backend -q
 ```
 
-当前 27 个测试覆盖：健康检查 / 错误协议 / 线程 CRUD + 持久化 / 检索事件序列 /
-结构化 papers / evidence 链路 / 取消令牌 / 导出 / 依赖探测。
+当前后端测试覆盖：健康检查 / 错误协议 / 线程 CRUD + 持久化 / running 崩溃恢复与 schema 迁移 /
+检索事件序列 / 结构化 papers / evidence 链路 / 取消令牌 / 导出 / 依赖探测 /
+删除与重命名竞态 / 原子缓存与 PDF 下载 / 中文排序去重 / 多 provider Key 与 endpoint 解析 /
+多源部分失败状态与 canonical record 合并。
 
 ## 已知限制
 
@@ -231,7 +258,8 @@ pytest tests/backend -q
 - 取消令牌不能中断已在飞的 HTTP 请求，只能在边界退出（同步 + requests 固有限制）。
 - Electron safeStorage 在无 keyring 的 Linux 不可用 → 明文回退 + UI 标注。
 - evidence chunk 文本截断到 500 字展示。
-- chunks 无章节/标题信息（字符窗口分块），引用精确到"分块 N"。
+- 页码/章节信息依赖 PDF 文本层的页边界和保守标题识别；扫描版 PDF 仍可能没有可靠元数据。
+- 引用校验能确认“标题 + 分块号”是否命中已保存 evidence，但不能替代人工核对论断的语义真实性。
 
 ## License
 
