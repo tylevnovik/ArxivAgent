@@ -10,6 +10,9 @@ app_backup.py
 # 文档渲染与排版验收产物
 /.docx_qa*/
 
+# Word 文档仅保留在本地
+*.docx
+
 # 第三方参考项目（仅用于架构对比，不属于本项目代码）
 reference-pasa/
 pasa/

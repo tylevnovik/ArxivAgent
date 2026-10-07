@@ -66,7 +66,7 @@ ArxivAgent 是一个论文检索研究工作台：左侧真线程列表，中间
 - `bun run build` ✅ 类型检查与 Vite 构建均通过。
 - `bun run test:e2e` ✅ 7 passed（含真实后端检索、证据、导出、重启与历史恢复链路）。
 - Python 源码编译、Electron 主进程与 mock 后端语法检查、`git diff --check` ✅。
-- 文档渲染验收目录 `.docx_qa*` 已加入 `.gitignore`；项目介绍 Word 文档单独提交。
+- 文档渲染验收目录 `.docx_qa*` 和 Word 文档已加入 `.gitignore`；项目介绍 Word 文档仅保留在本地。
 
 ## 验证状态（2026-09-06，历史复核）
 
