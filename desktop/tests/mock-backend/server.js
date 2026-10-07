@@ -16,6 +16,10 @@ const PORT = parseInt(process.argv[2] || "7861", 10);
 // 内存线程存储
 const threads = new Map();
 
+// 测试控制：接下来 count 次 GET /api/threads/:id 延迟 ms 毫秒返回
+// （由 POST /__mock/detail-delay 设置，用于 T1 乱序详情 E2E）。
+const detailDelay = { ms: 0, count: 0 };
+
 function threadMeta(id) {
 	const t = threads.get(id);
 	if (!t) return null;
@@ -170,7 +174,14 @@ const server = http.createServer((req, res) => {
 			});
 		}
 
-		// ---------- threads ----------
+			// ---------- 测试控制端点（仅 E2E 使用） ----------
+			if (path === "/__mock/detail-delay" && req.method === "POST") {
+				detailDelay.ms = Number(json.ms) || 0;
+				detailDelay.count = Number(json.count) || 1;
+				return json_(res, 200, { ok: true, ...detailDelay });
+			}
+
+			// ---------- threads ----------
 		if (path === "/api/threads" && req.method === "GET") {
 			return json_(res, 200, { ok: true, threads: [...threads.keys()].map(threadMeta) });
 		}
@@ -187,13 +198,19 @@ const server = http.createServer((req, res) => {
 
 			if (sub === undefined && req.method === "GET") {
 				if (!t) return json_(res, 404, errBody("not_found", "线程不存在", false));
-				return json_(res, 200, {
+				const payload = {
 					...threadMeta(tid),
 					messages: detailMessages(t),
 					papers: t.papers,
 					report: t.report,
 					evidence: t.evidence || [],
-				});
+				};
+				if (detailDelay.count > 0 && detailDelay.ms > 0) {
+					detailDelay.count -= 1;
+					const ms = detailDelay.ms;
+					return setTimeout(() => json_(res, 200, payload), ms);
+				}
+				return json_(res, 200, payload);
 			}
 			if (sub === undefined && req.method === "PATCH") {
 				if (!t) return json_(res, 404, errBody("not_found", "线程不存在", false));
@@ -217,10 +234,17 @@ const server = http.createServer((req, res) => {
 				t.status = "running";
 				t.messages.push({ role: "user", content: json.query, timestamp: now(), kind: "text" });
 				const slow = String(json.query).includes("[slow]");
+				// [sticky-cancel] / [sticky-cancel-<ms>]：取消已受理但 worker 仍在
+				// 收尾——cancel 后线程保持 running 一段时间再转 cancelled，
+				// 用于验证 UI 在上游阻塞时显示"正在停止"而不是立即声称已停止。
+				const stickyMatch = String(json.query).match(/\[sticky-cancel(?:-(\d+))?\]/);
+				if (stickyMatch) {
+					t.stickyCancelUntil = Date.now() + (stickyMatch[1] ? parseInt(stickyMatch[1], 10) : 2500);
+				}
 				return ndjson(res, scriptedEvents(t), {
-					delayMs: slow ? 120 : 0,
+					delayMs: slow || stickyMatch ? 120 : 0,
 					onComplete: () => finishScriptedThread(t),
-					onClose: () => { t.status = "cancelled"; },
+					onClose: () => scheduleCancel(t),
 				});
 			}
 			const msgMatch = sub && sub.match(/^messages\/(\d+)$/);
@@ -258,7 +282,7 @@ const server = http.createServer((req, res) => {
 				});
 			}
 			if (sub === "cancel" && req.method === "POST") {
-				if (t) t.status = "cancelled";
+				if (t) scheduleCancel(t);
 				return json_(res, 200, { ok: true, status: "cancel requested" });
 			}
 			if (sub === "papers" && req.method === "GET") {
@@ -325,6 +349,24 @@ function finishScriptedThread(t) {
 	if (!t.messages.some((message) => message.kind === "report" && message.content === t.report)) {
 		t.messages.push({ role: "assistant", content: t.report, timestamp: now(), kind: "report" });
 	}
+}
+
+/**
+ * 取消落地：sticky 窗口内保持 running（模拟 worker 收尾/上游阻塞），
+ * 窗口结束后才转 cancelled。幂等：窗口计时器只挂一个。
+ */
+function scheduleCancel(t) {
+	const remaining = (t.stickyCancelUntil || 0) - Date.now();
+	if (remaining > 0) {
+		if (!t.stickyTimer) {
+			t.stickyTimer = setTimeout(() => {
+				t.status = "cancelled";
+				t.stickyTimer = null;
+			}, remaining);
+		}
+		return;
+	}
+	t.status = "cancelled";
 }
 
 function json_(res, status, obj) {

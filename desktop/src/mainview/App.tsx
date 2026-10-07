@@ -99,6 +99,8 @@ import {
   waitForBackend,
 } from "./api";
 import { applyEvent, deriveProgress, withUserMessage, type SearchProgress } from "./eventReducer";
+import { useThreadSelection } from "./useThreadSelection";
+import { useStopConfirmation } from "./useStopConfirmation";
 import {
   clearProviderApiKey,
   hasSecretsBridge,
@@ -307,8 +309,6 @@ function App() {
 
   // ---------- 线程状态 ----------
   const [threads, setThreads] = useState<ThreadMeta[]>([]);
-  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
-  const [activeThread, setActiveThread] = useState<ThreadDetail | null>(null);
   const [isSearching, setIsSearching] = useState(false);
   const [statusText, setStatusText] = useState("就绪，等待输入...");
   const [activeTab, setActiveTab] = useState(0);
@@ -321,7 +321,6 @@ function App() {
   } | null>(null);
   const [progress, setProgress] = useState<SearchProgress | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const activeIdRef = useRef<string | null>(null);
   const runSequenceRef = useRef(0);
   const activeRunRef = useRef<{
     runId: number;
@@ -331,6 +330,23 @@ function App() {
 
   const notify = (message: string, severity: "success" | "info" | "warning" | "error") =>
     setToast({ message, severity });
+
+  // 会话选择的归属管理：activeThreadId/activeThread 状态与所有选择入口集中于此。
+  const selection = useThreadSelection({
+    getThread,
+    onLoadError: (err) => {
+      console.warn("加载线程详情失败", err);
+      notify("加载线程失败，请检查后端", "error");
+    },
+  });
+  const {
+    threadId: activeThreadId,
+    thread: activeThread,
+    setThread: setActiveThread,
+    threadIdRef,
+    generationRef,
+    fetchDetailIfCurrent,
+  } = selection;
 
   // 线程切换/新建时先失效旧 run。旧 run 的 finally 可能晚于新 run，
   // 因此不能再用全局 isSearching/abortRef 判断它是否拥有当前 UI 状态。
@@ -349,18 +365,12 @@ function App() {
   // ---------- 加载线程详情 ----------
   const selectThread = useCallback(
     async (id: string) => {
-      try {
-        const detail = await getThread(id);
-        activeIdRef.current = id;
-        setActiveThreadId(id);
-        setActiveThread(detail);
-        setStatusText(STATUS_LABEL[detail.status]);
-      } catch (err) {
-        console.warn("加载线程详情失败", err);
-        notify("加载线程失败，请检查后端", "error");
-      }
+      setStatusText("正在加载会话...");
+      const detail = await selection.selectThread(id);
+      // 已被更新的选择取代时不回写状态文本
+      if (detail) setStatusText(STATUS_LABEL[detail.status]);
     },
-    [notify],
+    [selection],
   );
 
   const refreshThreads = useCallback(async () => {
@@ -370,6 +380,70 @@ function App() {
       console.warn("刷新线程列表失败", err);
     }
   }, []);
+
+  // ---------- 停止确认（T6）：取消状态与后端真实状态一致 ----------
+  // cancel API 受理 ≠ 任务已结束：上游阻塞时后端仍是 running。本地 abort
+  // 后用带界限短轮询确认后端终态，超时则明确显示"停止尚未确认"。
+  const stopRequestedRef = useRef(false);
+  const stopThreadIdRef = useRef<string | null>(null);
+  const stop = useStopConfirmation({
+    getThread,
+    cancelThread,
+    onCancelRequestError: (err) => {
+      notify(`停止请求失败：${(err as Error)?.message || "请重试"}`, "error");
+    },
+    onConfirmed: (detail) => {
+      stopRequestedRef.current = false;
+      stopThreadIdRef.current = null;
+      setIsSearching(false);
+      setProgress(null);
+      if (threadIdRef.current === detail.id) {
+        selection.setThread(detail);
+        setStatusText(
+          detail.status === "cancelled" ? "已停止当前检索" : STATUS_LABEL[detail.status],
+        );
+        if (detail.status === "cancelled") {
+          // 本地提示消息只在此追加一次（后端会话不包含该提示）
+          selection.setThread((prev) =>
+            prev && prev.id === detail.id
+              ? {
+                  ...prev,
+                  messages: [
+                    ...prev.messages,
+                    {
+                      role: "assistant" as const,
+                      content: "已停止当前检索。",
+                      timestamp: new Date().toISOString(),
+                      kind: "text" as const,
+                    },
+                  ],
+                }
+              : prev,
+          );
+        }
+      }
+      void refreshThreads();
+    },
+    onTimeout: (threadId) => {
+      stopRequestedRef.current = false;
+      // 没有后端终态证据：不声称已停止。isSearching 保持 true（提交禁用），
+      // 停止按钮保留以便重新检查或重试取消。
+      if (threadIdRef.current === threadId) {
+        setStatusText("停止尚未确认，任务可能仍在运行；可再次点击停止重试");
+      }
+    },
+  });
+
+  // 切换/新建/删除会话时结束进行中的停止确认，让新会话立即可用。
+  const releaseStopWait = useCallback(() => {
+    if (stopRequestedRef.current || stopThreadIdRef.current) {
+      stop.cancelPendingPoll();
+      stopRequestedRef.current = false;
+      stopThreadIdRef.current = null;
+      setIsSearching(false);
+      setProgress(null);
+    }
+  }, [stop]);
 
   // 初始化：等后端就绪后加载列表；首次为空则建一个空线程。
   // 冷启动时渲染进程可能先于后端起来，一次性请求失败会永久卡死界面，所以先轮询。
@@ -409,6 +483,7 @@ function App() {
 
   // ---------- 新建线程 ----------
   const handleNewThread = useCallback(async () => {
+    releaseStopWait();
     invalidateActiveRun();
     try {
       const t = await createThread();
@@ -421,16 +496,20 @@ function App() {
       console.warn(err);
       notify("新建线程失败", "error");
     }
-  }, [invalidateActiveRun, selectThread, notify]);
+  }, [releaseStopWait, invalidateActiveRun, selectThread, notify]);
 
   // ---------- 切换线程 ----------
   const handleSelectThread = useCallback(
     async (id: string) => {
-      if (id === activeThreadId) return;
+      // 仅当目标会话已加载完成时才去重；详情未加载（加载中/失败）时允许
+      // 再次选择，否则 A→B→A 的重选会被这里的提前 return 拦住，B 的在途
+      // 请求返回后会覆盖 A。
+      if (id === activeThreadId && activeThread) return;
+      releaseStopWait();
       invalidateActiveRun();
       await selectThread(id);
     },
-    [activeThreadId, invalidateActiveRun, selectThread],
+    [activeThreadId, activeThread, releaseStopWait, invalidateActiveRun, selectThread],
   );
 
   // ---------- 重命名 ----------
@@ -454,6 +533,7 @@ function App() {
   const handleDeleteThread = useCallback(
     async (id: string) => {
       if (!confirm("确定删除该线程？此操作不可撤销。")) return;
+      releaseStopWait();
       if (id === activeThreadId && activeRunRef.current?.threadId === id) {
         invalidateActiveRun();
       }
@@ -475,7 +555,7 @@ function App() {
         notify("删除线程失败", "error");
       }
     },
-    [threads, activeThreadId, invalidateActiveRun, selectThread, notify],
+    [threads, activeThreadId, releaseStopWait, invalidateActiveRun, selectThread, notify],
   );
 
   // ---------- 发送消息 ----------
@@ -517,7 +597,7 @@ function App() {
           },
           (env) => {
             // 切换了线程就不再更新
-            if (activeRunRef.current?.runId !== runId || activeIdRef.current !== threadId) return;
+            if (activeRunRef.current?.runId !== runId || threadIdRef.current !== threadId) return;
             setActiveThread((prev) => (prev ? applyEvent(prev, env) : prev));
             setProgress((p) => deriveProgress(p, env));
             setStatusText(env.message || STATUS_LABEL.running);
@@ -536,45 +616,33 @@ function App() {
         if (activeRunRef.current?.runId !== runId) return;
         const e = err as Error & { code?: string };
         if (e?.name === "AbortError") {
-          setActiveThread((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  status: "cancelled",
-                  messages: [
-                    ...prev.messages,
-                    {
-                      role: "assistant",
-                      content: "已停止当前检索。",
-                      timestamp: new Date().toISOString(),
-                      kind: "text",
-                    },
-                  ],
-                }
-              : prev,
-          );
-          setStatusText("已停止当前检索");
-        } else {
-          setActiveThread((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  status: "error",
-                  messages: [
-                    ...prev.messages,
-                    {
-                      role: "assistant",
-                      content: e?.message ? `❌ ${e.message}` : "❌ 网络或后端异常",
-                      timestamp: new Date().toISOString(),
-                      kind: "text",
-                    },
-                  ],
-                  last_error: e?.message ?? "出错",
-                }
-              : prev,
-          );
-          setStatusText(e?.message || "出错");
+          if (stopRequestedRef.current) {
+            // 用户主动停止：终态与恢复由 useStopConfirmation 轮询接管——
+            // 不在此声称"已停止"，也不追加提示消息（后端可能仍在运行）。
+            return;
+          }
+          setStatusText("连接已中断");
+          return;
         }
+        setActiveThread((prev) =>
+          prev
+            ? {
+                ...prev,
+                status: "error",
+                messages: [
+                  ...prev.messages,
+                  {
+                    role: "assistant",
+                    content: e?.message ? `❌ ${e.message}` : "❌ 网络或后端异常",
+                    timestamp: new Date().toISOString(),
+                    kind: "text",
+                  },
+                ],
+                last_error: e?.message ?? "出错",
+              }
+            : prev,
+        );
+        setStatusText(e?.message || "出错");
       } finally {
         if (activeRunRef.current?.runId !== runId) {
           // 旧 run 只负责刷新列表，绝不能清掉当前线程/当前 run 的状态。
@@ -583,33 +651,53 @@ function App() {
         }
         activeRunRef.current = null;
         if (abortRef.current === controller) abortRef.current = null;
+        if (stopRequestedRef.current) {
+          // 用户停止：isSearching 保持 true（提交禁用），状态与恢复交给
+          // 停止确认轮询；不刷新详情覆盖"正在停止"状态。
+          await refreshThreads();
+          return;
+        }
         setIsSearching(false);
         setProgress(null);
-        if (activeIdRef.current === threadId) {
-          try {
-            const detail = await getThread(threadId);
-            setActiveThread(detail);
-            setStatusText(detail.status === "cancelled" ? "已停止当前检索" : STATUS_LABEL[detail.status]);
-          } catch (err) {
-            console.warn("刷新线程详情失败", err);
+        if (threadIdRef.current === threadId) {
+          // 收尾刷新在 await 后重新核对归属：selection generation、threadId
+          // （hook 内核对）、以及是否有新 run 启动（新 run 的乐观消息不能被
+          // 旧快照清掉）。
+          const detail = await fetchDetailIfCurrent(
+            threadId,
+            generationRef.current,
+            () => !activeRunRef.current,
+          );
+          if (detail) {
+            setStatusText(
+              detail.status === "cancelled" ? "已停止当前检索" : STATUS_LABEL[detail.status],
+            );
           }
         }
         await refreshThreads();
       }
     },
-    [isSearching, activeThread, config, refreshThreads],
+    [isSearching, activeThread, config, refreshThreads, threadIdRef, generationRef, fetchDetailIfCurrent],
   );
 
-  // ---------- 停止检索（真正取消后端） ----------
+  // ---------- 停止检索（真正取消后端 + 确认终态，T6） ----------
   const handleStopSearch = useCallback(() => {
     const run = activeRunRef.current;
-    if (run) {
-      run.controller.abort();
-      cancelThread(run.threadId).catch(() => {});
+    // 运行中 → 取当前 run；停止等待/超时态 → 重试上次停止的会话
+    const threadId = run?.threadId ?? (stop.phaseRef.current !== "idle" ? stopThreadIdRef.current : null);
+    if (!threadId) {
+      abortRef.current?.abort();
       return;
     }
-    abortRef.current?.abort();
-  }, []);
+    stopThreadIdRef.current = threadId;
+    stopRequestedRef.current = true;
+    run?.controller.abort(); // 幂等：重试时流早已中止
+    setStatusText("正在停止当前检索…");
+    const gen = generationRef.current;
+    void stop.confirmStop(threadId, () =>
+      generationRef.current === gen && threadIdRef.current === threadId,
+    );
+  }, [stop, generationRef, threadIdRef]);
 
   // ---------- 导出 ----------
   const handleExport = useCallback(
@@ -1300,7 +1388,7 @@ const ChatHeader = ({
       </Tooltip>
       <Box sx={{ minWidth: 0 }}>
         <Tooltip title={title}>
-          <Typography noWrap sx={{ fontSize: 19, fontWeight: 760, maxWidth: 360 }}>
+          <Typography noWrap data-testid="chat-title" sx={{ fontSize: 19, fontWeight: 760, maxWidth: 360 }}>
             {title}
           </Typography>
         </Tooltip>

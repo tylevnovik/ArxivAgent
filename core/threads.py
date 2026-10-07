@@ -19,7 +19,7 @@ import secrets
 import threading
 import tempfile
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import config
 from core.memory import Memory
@@ -202,6 +202,25 @@ class Thread:
 
 # ===================== 任务运行期索引 =====================
 
+def sync_derived_message_fields(thread: Thread, old_content: str, new_content: str = "") -> None:
+    """消息编辑/删除后同步派生字段（报告正文、用户查询）。
+
+    原 app.py._sync_derived_message_fields，移入 core 供 ThreadManager
+    的消息变更一致性入口复用；语义保持不变。
+    """
+    if old_content == thread.memory.final_report:
+        thread.memory.final_report = new_content
+    if old_content == thread.memory.user_query:
+        if new_content:
+            thread.memory.user_query = new_content
+        else:
+            first_user = next(
+                (m.get("content", "") for m in thread.memory.conversation if m.get("role") == "user"),
+                "",
+            )
+            thread.memory.user_query = first_user
+
+
 class TaskHandle:
     """一个正在运行（或刚结束）的检索任务的句柄。"""
 
@@ -370,7 +389,67 @@ class ThreadManager:
             thread.save()
             return True
 
+    # ---------- 消息变更一致性入口（T2） ----------
+
+    def mutate_messages(
+        self, thread_id: str, mutator: Callable[[Thread], None]
+    ) -> Optional[Thread]:
+        """消息编辑/删除的一致性入口：读-改-写在同一锁内完成。
+
+        存在性/tombstone/当前任务检查、读取最新快照、执行 mutator、
+        持久化全部持锁，并发的 rename/启动任务/删除在此期间排队，
+        旧快照无法覆盖已确认的标题、消息或 running 状态。
+
+        mutator 只做内存操作（禁止 LLM/PDF/HTTP 等长阻塞调用），其
+        异常原样上抛且不落盘。返回变更后的 Thread；线程不存在/已
+        删除/快照损坏返回 None；线程忙抛 ThreadBusyError。
+        """
+        if not _is_valid_thread_id(thread_id):
+            return None
+        path = os.path.join(config.THREADS_DIR, f"{thread_id}.json")
+        with self._lock:
+            if thread_id in self._deleted_ids or not os.path.exists(path):
+                return None
+            handle = self._tasks.get(thread_id)
+            if handle is not None and not handle.finished.is_set():
+                raise ThreadBusyError(f"线程 {thread_id} 已有任务在运行")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    thread = Thread.deserialize(json.load(f))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                return None
+            mutator(thread)
+            thread.save()
+            return thread
+
     # ---------- 任务索引 ----------
+
+    def begin_task(self, thread_id: str) -> tuple[TaskHandle, Thread]:
+        """任务启动的原子入口：读取最新快照与登记 handle 在同一锁内完成。
+
+        返回 (handle, thread)；agent 必须使用返回的快照（登记时刻的
+        磁盘状态），此后并发消息变更会被 mutate_messages 的忙检查
+        拒绝。锁内磁盘 IO 仅为小 JSON 读取，与 rename 同级。
+        线程忙抛 ThreadBusyError；不存在/已删除/快照不可读抛
+        ThreadDeletedError（路由映射为 404）。
+        """
+        if not _is_valid_thread_id(thread_id):
+            raise ThreadDeletedError(f"线程 {thread_id} 不存在或 id 非法")
+        path = os.path.join(config.THREADS_DIR, f"{thread_id}.json")
+        with self._lock:
+            if thread_id in self._deleted_ids or not os.path.exists(path):
+                raise ThreadDeletedError(f"线程 {thread_id} 不存在或已删除")
+            old = self._tasks.get(thread_id)
+            if old and not old.finished.is_set():
+                raise ThreadBusyError(f"线程 {thread_id} 已有任务在运行")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    thread = Thread.deserialize(json.load(f))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ThreadDeletedError(f"线程 {thread_id} 快照不可读: {exc}") from exc
+            handle = TaskHandle(thread_id)
+            self._tasks[thread_id] = handle
+            return handle, thread
 
     def start_task(self, thread_id: str) -> TaskHandle:
         """登记一个新任务，返回其 handle（含 cancel_event）。"""
@@ -398,14 +477,24 @@ class ThreadManager:
             self._tasks.pop(thread_id, None)
             self._deleted_ids.discard(thread_id)
 
-    def request_cancel(self, thread_id: str) -> bool:
-        """请求取消某线程当前任务。返回是否找到了在跑的任务。"""
+    def request_cancel(
+        self, thread_id: str, expected_handle: Optional[TaskHandle] = None
+    ) -> bool:
+        """请求取消某线程当前任务。返回是否找到了在跑的任务。
+
+        提供 expected_handle 时，仅当登记的任务就是该实例才设置取消：
+        旧流的收尾清理传入它捕获的 handle，避免误取消同一会话上新
+        启动的任务（T3）。用户显式 cancel API 不传该参数，保留
+        "取消当前任务"语义。实例核对与 set 在同一锁内完成。
+        """
         with self._lock:
             handle = self._tasks.get(thread_id)
-        if handle is None or handle.finished.is_set():
-            return False
-        handle.cancel_event.set()
-        return True
+            if handle is None or handle.finished.is_set():
+                return False
+            if expected_handle is not None and handle is not expected_handle:
+                return False
+            handle.cancel_event.set()
+            return True
 
     def cancel_all(self) -> None:
         """取消所有正在运行的任务（优雅关闭时调用）。"""

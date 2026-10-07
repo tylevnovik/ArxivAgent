@@ -31,10 +31,11 @@ bun run dev
 `dev` 启动 Vite (`http://localhost:5173`) + Electron。桌面主进程自动查找
 Python 后端并启动于 `http://127.0.0.1:7860`。
 
-首次运行需要安装依赖：
+从源码运行时首次需要安装 Python 依赖（**打包版安装包不需要**：
+安装包内置 Python 运行时与全部 site-packages，见下文"打包"）：
 
 ```bash
-# 安装 uv（如未安装）
+# 仅源码/开发运行需要 uv（打包版用户无需安装）
 pip install uv
 
 # 同步 Python 依赖（项目根目录）
@@ -60,9 +61,12 @@ ArxivAgent/
 │   ├── contracts.py          # Pydantic 产品契约（AgentEventEnvelope / ThreadDetail / EvidenceChunk）
 │   ├── threads.py            # 线程持久化管理（磁盘 JSON）
 │   ├── llm.py                # OpenAI 兼容 API 封装（DeepSeek / 自定义）
+│   ├── providers.py          # LLM 供应商目录与凭据/端点解析（唯一事实源）
+│   ├── auth.py               # 本地 HMAC-SHA256 请求签名与校验
 │   ├── arxiv_search.py       # arXiv API 封装
 │   ├── search_service.py     # 多源检索、缓存与排序服务
 │   ├── pdf_parser.py         # PDF 下载与文本提取分块
+│   ├── chunk_identity.py     # 正文分块内容指纹（缓存键 / Qdrant 集合身份共用）
 │   ├── rag.py                # 本地混合 RAG 检索器（Qdrant + BM25S + RRF）
 │   ├── memory.py             # 对话记忆 + evidence_chunks
 │   └── exporter.py          # 多格式导出（MD / CSV / JSON）
@@ -78,7 +82,7 @@ ArxivAgent/
 │   ├── src/electron/         #   主进程（Python 后端启动 / 依赖诊断 / safeStorage）
 │   ├── src/mainview/         #   渲染进程（线程列表 / 聊天 / 研究面板 / 引用 / 设置）
 │   └── tests/                #   E2E + 集成 + mock 后端
-├── tests/backend/            # 后端 pytest（200 tests）
+├── tests/backend/            # 后端 pytest（228 tests）
 ├── app.py                    # FastAPI 后端入口
 ├── config.py                 # 配置管理
 ├── pyproject.toml            # Python 依赖 & uv 配置
@@ -129,8 +133,11 @@ ArxivAgent/
 | GET | `/api/threads/{id}/papers` | 返回候选文献列表 |
 | GET | `/api/threads/{id}/report` | 返回最终报告 Markdown |
 | POST | `/api/threads/{id}/export` | 导出（chat / md / csv / json / report） |
+| GET | `/api/download` | 下载 exports 目录内的导出文件（防路径穿越） |
 | POST | `/api/config/health` | 探测 LLM / 检索源连通性 |
 | GET | `/api/config/health` | 获取上次探测结果 |
+| GET | `/api/auth/status` | 认证状态（HMAC 是否启用，启动诊断用） |
+| POST | `/api/shutdown` | 优雅关闭后端（HMAC 保护，桌面端退出时调用） |
 
 `/api/health`、`/api/system/deps`、`/api/auth/status` 仅用于启动诊断；配置健康探测
 需要桌面端 HMAC 签名。CORS 只允许本地 Vite 开发源和 Electron `file://` 页面，
@@ -236,8 +243,10 @@ cd desktop
 bun run build:canary   # prepare:backend-runtime + build + electron-builder --win nsis
 ```
 
-打包后内置 Python runtime + site-packages + `pyproject.toml`。
-目标机器如需更新依赖，桌面端 SetupWizard 会给出 `uv sync` 命令。
+打包后内置 Python runtime + site-packages + `pyproject.toml`：
+最终用户开箱即用，**不依赖目标机器安装 Python 或 uv**。
+桌面端 SetupWizard 的依赖诊断面向源码/开发部署；仅当使用系统 Python
+（而非内置 runtime）运行时，才需要按其给出的 `uv sync` 命令恢复依赖。
 
 ## 后端测试
 
@@ -247,9 +256,13 @@ pytest tests/backend -q
 ```
 
 当前后端测试覆盖：健康检查 / 错误协议 / 线程 CRUD + 持久化 / running 崩溃恢复与 schema 迁移 /
-检索事件序列 / 结构化 papers / evidence 链路 / 取消令牌 / 导出 / 依赖探测 /
-删除与重命名竞态 / 原子缓存与 PDF 下载 / 中文排序去重 / 多 provider Key 与 endpoint 解析 /
-多源部分失败状态与 canonical record 合并。
+检索事件序列 / 结构化 papers / evidence 链路 / 取消令牌与任务实例绑定 / 导出 / 依赖探测 /
+删除与重命名竞态 / 原子缓存与 PDF 下载 / 正文缓存内容身份 / 中文排序去重 / 多 provider Key 与
+endpoint 解析 / 多源部分失败状态与 canonical record 合并。
+
+Playwright E2E（7 用例）覆盖：检索完成 / 慢检索取消 / sticky 停止等待 / 乱序详情不覆盖当前会话 /
+切换线程并重命名删除，以及真实 FastAPI 后端全链路（检索 → 正文证据 → 导出 → 关闭重启 → 历史恢复）
+与 7860 端口占用 fail-fast；两个 spec 均独占 7860，串行执行（workers=1）。
 
 ## 已知限制
 

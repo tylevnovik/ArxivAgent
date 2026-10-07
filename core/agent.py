@@ -155,16 +155,23 @@ _RETRIEVER_CACHE_LOCK = threading.Lock()
 
 
 def _retriever_cache_key(chunks: list[dict]) -> str:
-    digest = hashlib.sha1()
-    for chunk in chunks:
-        raw = "|".join([
-            str(chunk.get("arxiv_id", "")),
-            str(chunk.get("paper_title", "")),
-            str(chunk.get("chunk_index", "")),
-            str(chunk.get("text", ""))[:500],
-        ])
-        digest.update((raw + "\n").encode("utf-8"))
-    return digest.hexdigest()[:16]
+    """进程级检索器缓存键（T4）。
+
+    = 分块聚合指纹（完整正文 + 证据元数据，版本化，见 core.chunk_identity）
+    + 影响索引构建的配置：检索器类型、embedding 模型、reranker 开关
+      （HybridRetriever 构建时读取的同组 config 值，不含任何密钥）。
+    旧实现仅取 text 前 500 字，之后的内容变化会命中旧缓存。
+    """
+    from core.chunk_identity import chunks_identity
+
+    payload = {
+        "chunks": chunks_identity(chunks),
+        "retriever_type": str(getattr(config, "RAG_RETRIEVER_TYPE", "hybrid")),
+        "embedding_model": str(getattr(config, "RAG_EMBEDDING_MODEL", "")),
+        "enable_reranker": bool(getattr(config, "RAG_ENABLE_RERANKER", False)),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
 def _retriever_cache_get(key: str):
@@ -881,7 +888,12 @@ class ArxivAgent:
         return queries[:4]
 
     def _build_rag_retriever(self, chunks: list[dict]):
-        """优先构建混合检索器，依赖不可用时回退到轻量 TF-IDF。带进程级缓存。"""
+        """优先构建混合检索器，依赖不可用时回退到轻量 TF-IDF。带进程级缓存。
+
+        失败回退缓存策略（T4）：hybrid 初始化失败产生的 TF-IDF 回退
+        不写入进程缓存——下一次总是先重试 hybrid，避免一次瞬时故障把
+        检索器永久固定在降级模式。显式配置的 TF-IDF 模式仍正常缓存。
+        """
         from core.rag import TFIDFRetriever
 
         cache_key = _retriever_cache_key(chunks)
@@ -889,6 +901,7 @@ class ArxivAgent:
         if cached is not None:
             return cached
 
+        used_fallback = False
         retriever_type = getattr(config, "RAG_RETRIEVER_TYPE", "hybrid")
         if retriever_type == "hybrid":
             try:
@@ -902,12 +915,15 @@ class ArxivAgent:
                 _retriever_cache_put(cache_key, entry)
                 return entry
             except Exception as e:
+                used_fallback = True
                 _safe_log(f"[WARN] Hybrid RAG initialization failed; falling back to TF-IDF: {e}")
 
         retriever = TFIDFRetriever()
         retriever.build_index(chunks)
         entry = (retriever, f"TFIDFRetriever(fallback, chunks={len(chunks)})")
-        _retriever_cache_put(cache_key, entry)
+        if not used_fallback:
+            # 显式 TF-IDF 配置可缓存；失败回退不缓存，下一轮重试 hybrid
+            _retriever_cache_put(cache_key, entry)
         return entry
 
     def _prune_stale_qdrant(self, retriever) -> None:

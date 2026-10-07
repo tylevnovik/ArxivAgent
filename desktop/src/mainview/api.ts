@@ -7,6 +7,8 @@
 
 export const API_BASE_URL = "http://127.0.0.1:7860";
 
+import { readNdjsonStream } from "./ndjson";
+
 // ===================== HMAC 认证 =====================
 
 /**
@@ -351,6 +353,7 @@ export async function getThreadReport(id: string): Promise<string> {
  * 发起一次检索/对话，流式读取 NDJSON 事件信封。
  * onEvent 在每条事件上调用；返回一个 AbortController 供 UI 停止读取。
  * 注意：这里只控制 HTTP 读取的 abort；真正的后端取消要走 cancelThread()。
+ * 流解析细节（尾行/坏行/终态校验）见 ndjson.ts。
  */
 export async function streamThreadMessage(
   threadId: string,
@@ -383,28 +386,8 @@ export async function streamThreadMessage(
     throw new Error(`HTTP ${res.status}`);
   }
 
-  const reader = res.body?.getReader();
-  if (!reader) throw new Error("无法读取返回流");
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const env = JSON.parse(trimmed) as AgentEventEnvelope;
-        onEvent(env);
-      } catch (err) {
-        console.warn("Failed to parse NDJSON line", err, trimmed);
-      }
-    }
-  }
+  if (!res.body) throw new Error("无法读取返回流");
+  await readNdjsonStream(res.body, onEvent);
 }
 
 // ===================== 导出 =====================

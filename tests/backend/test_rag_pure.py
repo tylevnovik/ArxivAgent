@@ -1,6 +1,12 @@
 """RAG 模块纯函数测试：不依赖 Qdrant / fastembed / 网络。"""
 from core.pdf_parser import chunk_text
-from core.rag import _collection_name, _prune_stale_collections, merge_retrievals
+from core.rag import (
+    _chunk_id,
+    _collection_name,
+    _normalize_chunk,
+    _prune_stale_collections,
+    merge_retrievals,
+)
 
 
 # ===================== merge_retrievals =====================
@@ -106,6 +112,84 @@ class TestCollectionName:
 
     def test_prefix(self):
         assert _collection_name("pfx", [{"chunk_id": "a"}], "m").startswith("pfx_")
+
+
+# ===================== T4：chunk_id / 集合身份覆盖完整内容 =====================
+
+def _base_chunk(**overrides):
+    chunk = {
+        "arxiv_id": "2405.00001",
+        "doi": "",
+        "paper_title": "Mock Paper",
+        "chunk_index": 0,
+        "text": "正文内容",
+        "page_number": 3,
+        "page_end": 3,
+        "section_title": "Methods",
+        "source_url": "https://arxiv.org/abs/2405.00001",
+        "pdf_url": "https://arxiv.org/pdf/2405.00001",
+    }
+    chunk.update(overrides)
+    return chunk
+
+
+class TestChunkIdentityFullContent:
+    def test_chunk_id_stable_for_same_input(self):
+        assert _chunk_id(_base_chunk(), 0) == _chunk_id(_base_chunk(), 0)
+
+    def test_chunk_id_covers_text_beyond_500_chars(self):
+        head = "A" * 500
+        old = _chunk_id(_base_chunk(text=head + "旧内容" * 50), 0)
+        new = _chunk_id(_base_chunk(text=head + "新内容" * 50), 0)
+        assert old != new, "500 字之后的内容变化必须产生不同的内容指纹"
+
+    def test_chunk_id_changes_with_evidence_metadata(self):
+        """仅页码/来源变化：指纹必须变化，evidence 才能用上新元数据。"""
+        old = _chunk_id(_base_chunk(page_number=3), 0)
+        new = _chunk_id(_base_chunk(page_number=7), 0)
+        assert old != new
+
+        old_url = _chunk_id(_base_chunk(source_url="https://a.example/1"), 0)
+        new_url = _chunk_id(_base_chunk(source_url="https://a.example/2"), 0)
+        assert old_url != new_url
+
+    def test_chunk_id_unambiguous_field_boundaries(self):
+        """结构化序列化：字段值里出现分隔符不得造成指纹碰撞。"""
+        a = _chunk_id(_base_chunk(arxiv_id="x", doi="y|z"), 0)
+        b = _chunk_id(_base_chunk(arxiv_id="x|y", doi="z"), 0)
+        assert a != b, "无转义 | 拼接会让不同字段内容得到相同指纹"
+
+    def test_normalize_chunk_replaces_external_id_with_content_fingerprint(self):
+        """外部传入的旧 chunk_id 只作来源标识保留，不得绕过新内容指纹。"""
+        chunk = _base_chunk()
+        chunk["chunk_id"] = "legacy-external-id"
+        normalized = _normalize_chunk(chunk, 0)
+        assert normalized["chunk_id"] != "legacy-external-id"
+        assert normalized["chunk_id"] == _chunk_id(_base_chunk(), 0)
+        assert normalized.get("source_chunk_id") == "legacy-external-id"
+
+    def test_normalize_chunk_without_external_id_unchanged_semantics(self):
+        normalized = _normalize_chunk(_base_chunk(), 0)
+        assert normalized["chunk_id"] == _chunk_id(_base_chunk(), 0)
+        assert "source_chunk_id" not in normalized
+
+    def test_collection_name_differs_when_only_metadata_differs(self):
+        c1 = _normalize_chunk(_base_chunk(page_number=3), 0)
+        c2 = _normalize_chunk(_base_chunk(page_number=7), 0)
+        assert _collection_name("pfx", [c1], "m") != _collection_name("pfx", [c2], "m")
+
+    def test_collection_name_differs_when_content_differs_after_500_chars(self):
+        head = "A" * 500
+        c1 = _normalize_chunk(_base_chunk(text=head + "旧内容" * 50), 0)
+        c2 = _normalize_chunk(_base_chunk(text=head + "新内容" * 50), 0)
+        assert _collection_name("pfx", [c1], "m") != _collection_name("pfx", [c2], "m"), (
+            "集合身份必须覆盖完整正文，否则过期 Qdrant 集合被复用"
+        )
+
+    def test_collection_name_stable_for_identical_input(self):
+        c1 = _normalize_chunk(_base_chunk(), 0)
+        c2 = _normalize_chunk(_base_chunk(), 0)
+        assert _collection_name("pfx", [c1], "m") == _collection_name("pfx", [c2], "m")
 
 
 # ===================== chunk_text（段落感知） =====================

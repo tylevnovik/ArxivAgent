@@ -187,3 +187,131 @@ class TestSelectRelevantPapers:
         # index 以字符串形式给出（LLM 常见）
         result = _select_relevant_papers([{"index": "3"}], PAPERS)
         assert result[0]["title"] == "Gamma Paper"
+
+
+# ===================== T4：进程级检索器缓存键 =====================
+
+def _cache_chunk(text="正文内容", **overrides):
+    chunk = {
+        "arxiv_id": "2405.00001",
+        "doi": "",
+        "paper_title": "Mock Paper",
+        "chunk_index": 0,
+        "text": text,
+        "page_number": 3,
+        "page_end": 3,
+        "section_title": "Methods",
+        "source_url": "https://arxiv.org/abs/2405.00001",
+        "pdf_url": "https://arxiv.org/pdf/2405.00001",
+    }
+    chunk.update(overrides)
+    return chunk
+
+
+class TestRetrieverCacheKey:
+    def test_stable_for_same_input(self):
+        from core.agent import _retriever_cache_key
+
+        chunks = [_cache_chunk()]
+        assert _retriever_cache_key(chunks) == _retriever_cache_key(list(chunks))
+
+    def test_changes_when_content_changes_after_500_chars(self):
+        from core.agent import _retriever_cache_key
+
+        head = "A" * 500
+        old = _retriever_cache_key([_cache_chunk(text=head + "旧内容" * 50)])
+        new = _retriever_cache_key([_cache_chunk(text=head + "新内容" * 50)])
+        assert old != new, "完整正文必须参与缓存键（旧实现截断到 500 字）"
+
+    def test_changes_with_evidence_metadata(self):
+        from core.agent import _retriever_cache_key
+
+        old = _retriever_cache_key([_cache_chunk(page_number=3)])
+        new = _retriever_cache_key([_cache_chunk(page_number=7)])
+        assert old != new, "证据元数据变化必须使缓存失效，否则 evidence 沿用旧页码"
+
+    def test_unambiguous_field_boundaries(self):
+        from core.agent import _retriever_cache_key
+
+        a = _retriever_cache_key([_cache_chunk(arxiv_id="x", doi="y|z")])
+        b = _retriever_cache_key([_cache_chunk(arxiv_id="x|y", doi="z")])
+        assert a != b
+
+    def test_changes_with_index_affecting_config(self, monkeypatch):
+        """检索器类型 / embedding 模型 / reranker 开关变化必须使缓存失效。"""
+        from core.agent import _retriever_cache_key
+        import config as config_mod
+
+        chunks = [_cache_chunk()]
+        base = _retriever_cache_key(chunks)
+
+        monkeypatch.setattr(config_mod, "RAG_RETRIEVER_TYPE", "tfidf")
+        assert _retriever_cache_key(chunks) != base, "检索器类型必须参与缓存键"
+
+        monkeypatch.setattr(config_mod, "RAG_RETRIEVER_TYPE", "hybrid")
+        monkeypatch.setattr(config_mod, "RAG_EMBEDDING_MODEL", "other-embedding-model")
+        assert _retriever_cache_key(chunks) != base, "embedding 模型必须参与缓存键"
+
+        monkeypatch.setattr(config_mod, "RAG_EMBEDDING_MODEL", "default")
+        monkeypatch.setattr(config_mod, "RAG_ENABLE_RERANKER", True)
+        assert _retriever_cache_key(chunks) != base, "reranker 开关必须参与缓存键"
+
+
+class TestFallbackRetrieverNotPinned:
+    def test_fallback_tfidf_not_pinned_after_hybrid_recovery(
+        self, isolated_data_dir, monkeypatch
+    ):
+        """失败回退缓存失效策略：TF-IDF 回退结果不进进程缓存。
+
+        第一次 hybrid 构建失败 → 返回 TF-IDF 回退；第二次 hybrid 恢复
+        → 必须返回 hybrid，而不是被缓存固定的降级 TF-IDF。
+        """
+        from core.agent import ArxivAgent
+        from core import rag as rag_mod
+
+        monkeypatch.setattr(rag_mod, "TFIDFRetriever", _StubTFIDF)
+
+        hybrid_attempts = {"v": 0}
+
+        class FlakyHybrid:
+            def __init__(self, *args, **kwargs):
+                hybrid_attempts["v"] += 1
+                if hybrid_attempts["v"] == 1:
+                    raise RuntimeError("注入的 hybrid 初始化失败")
+                self.dense_retriever = None
+                self.bm25_retriever = None
+                self.chunks = []
+
+            def build_index(self, chunks):
+                self.chunks = chunks
+
+            @property
+            def index_summary(self):
+                return "FlakyHybrid(ok)"
+
+        monkeypatch.setattr(rag_mod, "HybridRetriever", FlakyHybrid)
+
+        agent = ArxivAgent(api_key="sk-test")
+        chunks = [_cache_chunk(text=f"chunk-{i}") for i in range(2)]
+
+        first = agent._build_rag_retriever(chunks)
+        assert "TFIDF" in first[1], "第一次失败应回退 TF-IDF"
+
+        second = agent._build_rag_retriever(chunks)
+        assert "FlakyHybrid" in second[1], (
+            "hybrid 恢复后不得复用被缓存的 TF-IDF 回退检索器"
+        )
+
+
+class _StubTFIDF:
+    """轻量 TF-IDF 替身：记录 build_index 调用即可。"""
+
+    last_instance = None
+
+    def __init__(self):
+        self.built = False
+        _StubTFIDF.last_instance = self
+
+    def build_index(self, chunks):
+        self.built = True
+        self.chunks = chunks

@@ -188,7 +188,13 @@ function registerExportHandlers() {
 			|| filename !== path.basename(filename) || filename.includes("..")) {
 			return { ok: false, cancelled: false, path: null, error: "非法文件名" };
 		}
-		const src = path.join(backendDataDirPath(), "exports", filename);
+		// E2E harness 用 ARXIV_AGENT_E2E_DATA_DIR 覆盖后端数据目录时，
+		// 导出源目录必须随之对齐；生产始终是 backend-data/exports。
+		const sourceExportsDir =
+			process.env.ARXIV_AGENT_E2E === "1" && process.env.ARXIV_AGENT_E2E_DATA_DIR
+				? path.join(process.env.ARXIV_AGENT_E2E_DATA_DIR, "exports")
+				: path.join(backendDataDirPath(), "exports");
+		const src = path.join(sourceExportsDir, filename);
 		if (!fs.existsSync(src)) {
 			return { ok: false, cancelled: false, path: null, error: `导出文件不存在: ${filename}` };
 		}
@@ -609,7 +615,10 @@ async function startPythonBackend() {
 
 	const pythonInfo = findPythonPath(backendRoot);
 	const pythonPath = pythonInfo.path;
-	const appPyPath = path.join(backendRoot, "app.py");
+	// E2E harness 可用 ARXIV_AGENT_E2E_BACKEND_ENTRY 指定入口脚本（真实
+	// app.py 的薄封装，仅替换 LLM/provider/PDF 外部边界）；生产默认 app.py。
+	const appPyPath =
+		process.env.ARXIV_AGENT_E2E_BACKEND_ENTRY || path.join(backendRoot, "app.py");
 	const backendDataDir = backendDataDirPath();
 	fs.mkdirSync(backendDataDir, { recursive: true });
 	const pidFile = path.join(backendDataDir, "backend.pid");

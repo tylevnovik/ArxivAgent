@@ -49,14 +49,38 @@ ArxivAgent 是一个论文检索研究工作台：左侧真线程列表，中间
 - 测试：markdown 安全单测（XSS 各路径）。
 
 ### 测试闭环（当前）
-- **后端 pytest** (200 collected)：health / 错误协议 / 线程 CRUD+持久化 / running 崩溃恢复与 schema 迁移 /
-  检索事件序列 / 结构化 papers / **evidence 链路** / 取消令牌 / 导出 / **deps 探测** /
-  原子缓存与 PDF 下载 / 多源合并与 provider 部分失败状态。
-- **前端 vitest** (52 passed)：eventReducer / secrets / provider override / **citation 解析+match+split** /
-  **markdown 安全** / **mock 后端集成闭环** / keyless provider / config failure recovery /
-  rename/export/delete。
+- **后端 pytest** (228 collected)：health / 错误协议 / 线程 CRUD+持久化 / running 崩溃恢复与 schema 迁移 /
+  检索事件序列 / 结构化 papers / **evidence 链路** / 取消令牌与任务实例绑定 / 导出 / **deps 探测** /
+  原子缓存与 PDF 下载 / **正文缓存内容身份** / 多源合并与 provider 部分失败状态。
+- **前端 vitest** (77 passed / 10 files)：eventReducer / secrets / provider override / **citation 解析+match+split** /
+  **markdown 安全** / **mock 后端集成闭环** / **NDJSON 流读取（UTF-8 跨块 / 坏 JSON / 流中断）** /
+  **线程选择乱序隔离（useThreadSelection）** / **停止确认与后端终态一致（useStopConfirmation）** /
+  keyless provider / config failure recovery / rename/export/delete。
+- **Playwright E2E** (7 cases)：检索完成 / 慢检索取消 / sticky 停止等待 / 乱序详情 /
+  切换线程重命名删除 / 真实 FastAPI 后端全链路 / 端口占用 fail-fast。
 
-## 最新验证状态（2026-08-31）
+## 最新验证状态（2026-10-07，提交前复核）
+
+- `uv run pytest tests/backend -q` ✅ 228 passed（1 个既有 Starlette 弃用警告）。
+- `bun run test:unit` ✅ 10 files / 77 passed。
+- `bun run build` ✅ 类型检查与 Vite 构建均通过。
+- `bun run test:e2e` ✅ 7 passed（含真实后端检索、证据、导出、重启与历史恢复链路）。
+- Python 源码编译、Electron 主进程与 mock 后端语法检查、`git diff --check` ✅。
+- 文档渲染验收目录 `.docx_qa*` 已加入 `.gitignore`；项目介绍 Word 文档单独提交。
+
+## 验证状态（2026-09-06，历史复核）
+
+与 2026-09-05 T7 发布记录同一工作区（改动仍未提交），本轮实跑复核并同步刷新文档过期数字：
+
+- `pytest tests/backend -q` ✅ 228 passed（1 个既有 Starlette 弃用警告）。
+- `bun run typecheck` ✅
+- `bun run test:unit` ✅ 10 files / 77 passed。
+- E2E / smoke / 打包链路最近一次完整验证见文末「发布记录（2026-09-05）」（E2E 7 passed + unpacked 冒烟）。
+- 本轮修正 README 与本文档中的过期内容：测试数量（200→228、52→77）、core 结构图补
+  `auth.py` / `providers.py` / `chunk_identity.py`、API 表补
+  `/api/download` / `/api/auth/status` / `/api/shutdown`。
+
+## 验证状态（2026-08-31，历史记录）
 
 - `uv run pytest tests/backend -q` ✅ 200 passed，1 个既有 Starlette 弃用警告。
 - `bun run typecheck` ✅
@@ -138,3 +162,24 @@ desktop/src/mainview/{citations,markdown,eventReducer}.test.ts [新/改]
   `desktop/scripts/smoke-packaged.cjs` 提供超时、退出码和进程树清理。
 - `.github/workflows/ci.yml`：加入后端 pytest/compile、前端 typecheck/unit/build 和 Electron E2E。
 - 详细任务分解见 `docs/plans/2026-08-29-stabilize-project.md`。
+
+## 并发一致性修复与用户路径验收（2026-09-05，T7）
+
+依据 `docs/plans/2026-09-05-luna-review-execution.md`（T1-T7）落地的用户路径验收：
+
+- `desktop/tests/e2e/app.spec.ts`：新增 T6 sticky-cancel 用例（cancel 受理后后端保持
+  running，UI 显示"正在停止"、提交禁用，终态确认后恢复且停止消息只追加一条）与 T1
+  乱序详情用例（`/__mock/detail-delay` 控制端点 + `chat-title` test-id 断言迟到响应
+  不得覆盖当前会话）；每个测试 try/finally 关闭窗口；7860 端口预检失败快速报错。
+- `desktop/tests/e2e/backend-flow.spec.ts` + `backend_harness.py` [新]：真实 FastAPI
+  （路由/worker/持久化/HMAC 认证链）+ 真实 Electron 全链路；harness 仅替换 LLM 流、
+  检索源、PDF 下载、embedding（确定性伪向量 + qdrant :memory:）。全新临时 DATA_DIR，
+  覆盖 检索→正文证据→导出→关闭重启→历史恢复。
+- `desktop/src/electron/main.cjs`：`ARXIV_AGENT_E2E_BACKEND_ENTRY`（E2E 后端入口覆盖，
+  生产默认 app.py）；`exports:save` 源目录在 E2E 数据目录覆盖下随之对齐。
+- `desktop/tests/mock-backend/server.js`：`/__mock/detail-delay` 控制端点与
+  `[sticky-cancel]`/`[sticky-cancel-<ms>]` 脚本（cancel 受理后延迟转 cancelled）。
+- `desktop/playwright.config.ts`：trace 改 retain-on-failure（原 on-first-retry 与
+  retries=0 组合永不产生 trace）、workers=1（两个 spec 独占 7860，必须串行）。
+- `.github/workflows/ci.yml`：E2E 失败时上传 test-results/ 与 playwright-report/。
+- `README.md`：依赖恢复说明按内置 Python 运行时核对——打包版用户不需要 uv/Python。

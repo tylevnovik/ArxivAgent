@@ -512,7 +512,13 @@ def _query_qdrant_points(client, collection_name: str, query_vector: list[float]
 
 
 def _collection_name(prefix: str, chunks: list[dict], model_tag: str = "") -> str:
-    digest = hashlib.sha1()
+    """Qdrant 集合身份：embedding 模型标签 + 全部分块的内容指纹。
+
+    chunks 应为 _normalize_chunk 产物（chunk_id = 版本化内容指纹，
+    覆盖完整正文与证据元数据），因此仅页码/来源变化或 500 字之后的
+    正文变化都会得到新集合，过期集合不再被复用（T4）。
+    """
+    digest = hashlib.sha256()
     digest.update((str(model_tag) + "\n").encode("utf-8"))
     for chunk in chunks:
         digest.update((chunk.get("chunk_id", "") + "\n").encode("utf-8"))
@@ -570,19 +576,25 @@ def _normalize_chunk(chunk: dict, idx: int) -> dict:
     normalized = chunk.copy()
     normalized.setdefault("chunk_index", idx)
     normalized.setdefault("text", "")
-    normalized["chunk_id"] = normalized.get("chunk_id") or _chunk_id(normalized, idx)
+    # 外部传入的 chunk_id（旧格式或外部来源）仅作来源标识保留；chunk_id
+    # 一律改为新版本内容指纹，避免旧 ID 绕过新指纹导致过期集合复用（T4）。
+    external_id = normalized.get("chunk_id")
+    if external_id:
+        normalized.setdefault("source_chunk_id", external_id)
+    normalized["chunk_id"] = _chunk_id(normalized, idx)
     return normalized
 
 
 def _chunk_id(chunk: dict, idx: int) -> str:
-    raw = "|".join([
-        str(chunk.get("arxiv_id", "")),
-        str(chunk.get("doi", "")),
-        str(chunk.get("paper_title", "")),
-        str(chunk.get("chunk_index", idx)),
-        str(chunk.get("text", ""))[:500],
-    ])
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    """分块内容指纹：版本化、完整正文、结构化序列化（见 core.chunk_identity）。
+
+    idx 仅在 chunk_index 缺失时作为兜底参与指纹。
+    """
+    from core.chunk_identity import chunk_content_fingerprint
+
+    payload = dict(chunk)
+    payload.setdefault("chunk_index", idx)
+    return chunk_content_fingerprint(payload)
 
 
 def _to_float_list(vector) -> list[float]:

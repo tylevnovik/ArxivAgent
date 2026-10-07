@@ -56,7 +56,13 @@ from core.providers import (
     ResolvedProviderConfig,
     resolve_provider_config,
 )
-from core.threads import Thread, ThreadBusyError, ThreadDeletedError, thread_manager
+from core.threads import (
+    Thread,
+    ThreadBusyError,
+    ThreadDeletedError,
+    sync_derived_message_fields,
+    thread_manager,
+)
 from core import exporter
 import config
 
@@ -396,66 +402,42 @@ def api_rename_thread(thread_id: str, body: ThreadPatchRequest):
     return ThreadMeta(**thread.meta_dict())
 
 
-def _message_mutation_busy_error(thread_id: str) -> Optional[JSONResponse]:
-    existing = thread_manager.get_task(thread_id)
-    if existing is not None and not existing.finished.is_set():
-        return _error_json(
-            ErrorCode.THREAD_BUSY,
-            "该线程正在运行，完成或停止后才能编辑消息。",
-            recoverable=True,
-            status_code=409,
-        )
-    return None
-
-
-def _resolve_message(thread: Thread, message_index: int) -> tuple[Optional[dict], Optional[JSONResponse]]:
+def _raise_message_index_error(thread: Thread, message_index: int) -> dict:
+    """mutator 内定位消息；越界抛 LookupError，由路由映射为 404。"""
     if message_index < 0 or message_index >= len(thread.memory.conversation):
-        return None, _error_json(
-            ErrorCode.NOT_FOUND,
-            f"消息 {message_index} 不存在",
-            recoverable=False,
-            status_code=404,
-        )
-    return thread.memory.conversation[message_index], None
-
-
-def _sync_derived_message_fields(thread: Thread, old_content: str, new_content: str = "") -> None:
-    if old_content == thread.memory.final_report:
-        thread.memory.final_report = new_content
-    if old_content == thread.memory.user_query:
-        if new_content:
-            thread.memory.user_query = new_content
-        else:
-            first_user = next(
-                (m.get("content", "") for m in thread.memory.conversation if m.get("role") == "user"),
-                "",
-            )
-            thread.memory.user_query = first_user
+        raise LookupError(f"消息 {message_index} 不存在")
+    return thread.memory.conversation[message_index]
 
 
 @app.patch("/api/threads/{thread_id}/messages/{message_index}")
 def api_patch_thread_message(thread_id: str, message_index: int, body: MessagePatchRequest):
-    thread, err = _resolve_thread_for_message(thread_id)
+    # 早检查仅用于保持 404/409 的错误优先级；真正的读-改-写全部走
+    # mutate_messages 的同一锁一致性入口，路由不再直接读改写旧 Thread。
+    _, err = _resolve_thread_for_message(thread_id)
     if err is not None:
         return err
-    busy = _message_mutation_busy_error(thread_id)
-    if busy is not None:
-        return busy
 
     content = (body.content or "").strip()
     if not content:
         return _error_json(ErrorCode.VALIDATION, "消息内容不能为空", status_code=400)
 
-    message, msg_err = _resolve_message(thread, message_index)
-    if msg_err is not None:
-        return msg_err
+    def mutate(thread: Thread) -> None:
+        message = _raise_message_index_error(thread, message_index)
+        old_content = str(message.get("content", "") or "")
+        message["content"] = content
+        if not message.get("timestamp"):
+            message["timestamp"] = datetime.now().isoformat()
+        sync_derived_message_fields(thread, old_content, content)
 
-    old_content = str(message.get("content", "") or "")
-    message["content"] = content
-    if not message.get("timestamp"):
-        message["timestamp"] = datetime.now().isoformat()
-    _sync_derived_message_fields(thread, old_content, content)
-    if not thread_manager.persist(thread):
+    try:
+        thread = thread_manager.mutate_messages(thread_id, mutate)
+    except ThreadBusyError:
+        return _error_json(ErrorCode.THREAD_BUSY, "该线程已有检索任务在运行",
+                           recoverable=True, status_code=409)
+    except LookupError as e:
+        return _error_json(ErrorCode.NOT_FOUND, str(e),
+                           recoverable=False, status_code=404)
+    if thread is None:
         return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
                            recoverable=False, status_code=404)
     return ThreadDetail(**thread.detail_dict())
@@ -463,21 +445,25 @@ def api_patch_thread_message(thread_id: str, message_index: int, body: MessagePa
 
 @app.delete("/api/threads/{thread_id}/messages/{message_index}")
 def api_delete_thread_message(thread_id: str, message_index: int):
-    thread, err = _resolve_thread_for_message(thread_id)
+    _, err = _resolve_thread_for_message(thread_id)
     if err is not None:
         return err
-    busy = _message_mutation_busy_error(thread_id)
-    if busy is not None:
-        return busy
 
-    message, msg_err = _resolve_message(thread, message_index)
-    if msg_err is not None:
-        return msg_err
+    def mutate(thread: Thread) -> None:
+        message = _raise_message_index_error(thread, message_index)
+        old_content = str(message.get("content", "") or "")
+        del thread.memory.conversation[message_index]
+        sync_derived_message_fields(thread, old_content, "")
 
-    old_content = str(message.get("content", "") or "")
-    del thread.memory.conversation[message_index]
-    _sync_derived_message_fields(thread, old_content, "")
-    if not thread_manager.persist(thread):
+    try:
+        thread = thread_manager.mutate_messages(thread_id, mutate)
+    except ThreadBusyError:
+        return _error_json(ErrorCode.THREAD_BUSY, "该线程已有检索任务在运行",
+                           recoverable=True, status_code=409)
+    except LookupError as e:
+        return _error_json(ErrorCode.NOT_FOUND, str(e),
+                           recoverable=False, status_code=404)
+    if thread is None:
         return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
                            recoverable=False, status_code=404)
     return ThreadDetail(**thread.detail_dict())
@@ -531,6 +517,21 @@ def _build_agent_for_thread(
     # 用已持久化的 memory 恢复上下文，支持多轮
     agent.memory = thread.memory
     return agent
+
+
+def _cleanup_failed_start(thread: Thread, handle, message: str) -> None:
+    """任务登记后、成功启动前的失败清理（T3）。
+
+    尽力把明确 error 状态落盘（磁盘故障时静默放弃，不掩盖后续注销），
+    再按 handle 校验注销登记，避免线程被无人运行的任务永久占住。
+    """
+    thread.status = "error"
+    thread.last_error = message
+    try:
+        thread_manager.persist(thread, handle)
+    except Exception:  # noqa: BLE001 - 磁盘故障时尽力而为，注销不能失败
+        pass
+    thread_manager.finish_task(thread.id, handle)
 
 
 def _run_agent_worker(thread: Thread, agent: ArxivAgent, query: str,
@@ -592,7 +593,8 @@ def _run_agent_worker(thread: Thread, agent: ArxivAgent, query: str,
 
 @app.post("/api/threads/{thread_id}/messages")
 async def api_thread_message(thread_id: str, body: MessageRequest):
-    thread, err = _resolve_thread_for_message(thread_id)
+    # 早检查仅用于保持 404/409 优先级；真正的快照与任务登记走 begin_task。
+    _, err = _resolve_thread_for_message(thread_id)
     if err is not None:
         return err
 
@@ -635,19 +637,10 @@ async def api_thread_message(thread_id: str, body: MessageRequest):
             )
         body.providers = normalized
 
-    # 构造 agent：捕获 _make_provider 抛出的 ValueError 等构造期错误，
-    # 转成结构化 invalid_provider 错误（防御性兜底，正常路径已被上面的校验拦下）。
+    # 原子启动（T2）：读取最新快照与登记 handle 在同一锁内完成，agent
+    # 使用登记时快照；此后并发的消息变更被 mutate_messages 忙检查拒绝。
     try:
-        agent = _build_agent_for_thread(thread, body, llm_config)
-    except ValueError as e:
-        return _error_json(
-            ErrorCode.INVALID_PROVIDER,
-            str(e) or "无效的检索源配置。",
-            recoverable=True, status_code=400,
-        )
-
-    try:
-        handle = thread_manager.start_task(thread.id)
+        handle, thread = thread_manager.begin_task(thread_id)
     except ThreadBusyError:
         return _error_json(
             ErrorCode.THREAD_BUSY,
@@ -658,6 +651,19 @@ async def api_thread_message(thread_id: str, body: MessageRequest):
     except ThreadDeletedError:
         return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
                            recoverable=False, status_code=404)
+
+    # 构造 agent：捕获 _make_provider 抛出的 ValueError 等构造期错误，
+    # 转成结构化 invalid_provider 错误（防御性兜底，正常路径已被上面的校验拦下）。
+    try:
+        agent = _build_agent_for_thread(thread, body, llm_config)
+    except ValueError as e:
+        # 构造失败走统一清理：落盘 error 状态 + 按 handle 校验注销登记
+        _cleanup_failed_start(thread, handle, f"Agent 构造失败：{e or '无效的检索源配置'}")
+        return _error_json(
+            ErrorCode.INVALID_PROVIDER,
+            str(e) or "无效的检索源配置。",
+            recoverable=True, status_code=400,
+        )
     agent.cancel_event = handle.cancel_event
 
     out_queue: "queue.Queue[Optional[AgentEventEnvelope]]" = queue.Queue()
@@ -668,29 +674,69 @@ async def api_thread_message(thread_id: str, body: MessageRequest):
     )
     handle.worker = worker
     thread.status = "running"
-    if not thread_manager.persist(thread, handle):
+    try:
+        persisted = thread_manager.persist(thread, handle)
+    except OSError as e:
+        _cleanup_failed_start(thread, handle, f"任务状态写入失败：{e}")
+        return _error_json(
+            ErrorCode.INTERNAL,
+            f"任务启动失败：无法写入线程状态（{e}）。",
+            recoverable=True,
+            status_code=500,
+        )
+    if not persisted:
+        # 线程已删除：登记必须释放，错误状态无需落盘（tombstone 生效）
         thread_manager.finish_task(thread.id, handle)
         return _error_json(ErrorCode.NOT_FOUND, f"线程 {thread_id} 不存在",
                            recoverable=False, status_code=404)
-    worker.start()
+    try:
+        worker.start()
+    except Exception as e:  # noqa: BLE001 - 启动失败必须清理登记，不能永久 409
+        _cleanup_failed_start(thread, handle, f"后台任务启动失败：{e}")
+        return _error_json(
+            ErrorCode.INTERNAL,
+            f"任务启动失败：{e}",
+            recoverable=True,
+            status_code=500,
+        )
 
+    return StreamingResponse(
+        _make_ndjson_stream(thread, handle, out_queue),
+        media_type="application/x-ndjson",
+    )
+
+
+def _make_ndjson_stream(thread: Thread, handle, out_queue: "queue.Queue"):
+    """构造 NDJSON 事件流的响应体（T3）。
+
+    - 队列等待带 0.5s 界限：客户端断开或协程取消后，阻塞在线程池里的
+      get 至多 0.5s 自行返回；随后检查任务取消/结束状态即退出，不再
+      无限等待，也不会在无消费者时无限累积事件（队列保持无界，worker
+      收尾即停止投递，不会堵死在 put）。
+    - finally 只取消"捕获的 handle"对应的任务：旧流的收尾不会误取消
+      同一会话上新启动的任务。
+    """
     async def ndjson_generator():
         try:
             # 标记运行开始
             yield AgentEventEnvelope(type="intent", message="Agent 已启动…").model_dump_json() + "\n"
             while True:
-                # queue.Queue.get() is blocking; running it directly here would
-                # stall FastAPI's event loop and unrelated requests.  The worker
-                # thread remains the producer, while the wait is offloaded.
-                item = await asyncio.to_thread(out_queue.get)
+                try:
+                    item = await asyncio.to_thread(out_queue.get, True, 0.5)
+                except queue.Empty:
+                    # 队列暂空：任务已取消或 worker 已结束（哨兵丢失）时退出
+                    if handle.finished.is_set() or handle.cancel_event.is_set():
+                        break
+                    continue
                 if item is None:
                     break
                 yield item.model_dump_json() + "\n"
         finally:
-            # 客户端断开：请求取消后台任务（防止后台空跑）
-            thread_manager.request_cancel(thread.id)
+            # 客户端断开：仅请求取消本流对应的任务（防止后台空跑），
+            # 不影响同会话上新登记的任务。
+            thread_manager.request_cancel(thread.id, expected_handle=handle)
 
-    return StreamingResponse(ndjson_generator(), media_type="application/x-ndjson")
+    return ndjson_generator()
 
 
 @app.post("/api/threads/{thread_id}/cancel")
